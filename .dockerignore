@@ -1,0 +1,9 @@
+data/
+models/
+__pycache__/
+*.pyc
+.github/
+docs/
+tests/
+eval/results/
+scripts/bench_results/

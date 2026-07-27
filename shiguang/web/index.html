@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>拾光 · 本地相册第二大脑</title>
+<style>
+  :root {
+    --bg: #101214; --panel: #191c1f; --line: #2a2e33;
+    --text: #e8eaed; --muted: #9aa0a6; --accent: #4f8cff;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text);
+         font-family: "PingFang SC", "Microsoft YaHei", system-ui, sans-serif; }
+  header { position: sticky; top: 0; z-index: 10; background: rgba(16,18,20,.92);
+           backdrop-filter: blur(8px); border-bottom: 1px solid var(--line);
+           padding: 14px 20px; display: flex; gap: 14px; align-items: center; flex-wrap: wrap; }
+  h1 { font-size: 18px; font-weight: 600; letter-spacing: 2px; }
+  h1 span { color: var(--accent); }
+  .searchbox { flex: 1; min-width: 260px; display: flex; gap: 8px; }
+  .searchbox input { flex: 1; background: var(--panel); border: 1px solid var(--line);
+    color: var(--text); border-radius: 10px; padding: 10px 14px; font-size: 15px; outline: none; }
+  .searchbox input:focus { border-color: var(--accent); }
+  button { background: var(--accent); color: #fff; border: 0; border-radius: 10px;
+           padding: 10px 18px; font-size: 14px; cursor: pointer; }
+  button.ghost { background: transparent; color: var(--muted); border: 1px solid var(--line); }
+  button:hover { filter: brightness(1.1); }
+  nav { display: flex; gap: 6px; }
+  nav button.active { background: var(--panel); color: var(--accent); border: 1px solid var(--accent); }
+  main { padding: 18px 20px; max-width: 1500px; margin: 0 auto; }
+  .meta { color: var(--muted); font-size: 13px; margin: 4px 0 14px; min-height: 18px; }
+  .meta code { color: var(--accent); }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 10px; }
+  .card { background: var(--panel); border-radius: 10px; overflow: hidden; cursor: pointer;
+          border: 1px solid var(--line); transition: transform .12s; }
+  .card:hover { transform: translateY(-2px); border-color: var(--accent); }
+  .card img { width: 100%; aspect-ratio: 4/3; object-fit: cover; display: block; background: #000; }
+  .card .cap { padding: 7px 9px; font-size: 12px; color: var(--muted);
+               white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .tag { display: inline-block; font-size: 11px; padding: 1px 6px; border-radius: 5px;
+         background: #2b3a55; color: #8ab4ff; margin-right: 5px; }
+  .empty { color: var(--muted); text-align: center; padding: 70px 0; font-size: 15px; line-height: 2; }
+  dialog { border: 1px solid var(--line); border-radius: 14px; background: var(--panel);
+           color: var(--text); max-width: 86vw; padding: 0; }
+  dialog::backdrop { background: rgba(0,0,0,.75); }
+  dialog img { max-width: 84vw; max-height: 74vh; display: block; }
+  dialog .info { padding: 12px 16px; font-size: 13px; color: var(--muted); max-width: 84vw; }
+  .bar { height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; margin-top: 6px; }
+  .bar i { display: block; height: 100%; background: var(--accent); transition: width .3s; }
+  .settings { background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+              padding: 18px; max-width: 720px; }
+  .settings textarea { width: 100%; height: 90px; background: var(--bg); color: var(--text);
+    border: 1px solid var(--line); border-radius: 8px; padding: 10px; font-size: 14px; }
+  .settings .row { display: flex; gap: 10px; margin-top: 12px; align-items: center; }
+  .pill { font-size: 12px; color: var(--muted); border: 1px solid var(--line);
+          padding: 3px 10px; border-radius: 99px; }
+  .person { text-align: center; }
+  .person input { width: 90%; margin: 6px 0; background: var(--bg); color: var(--text);
+    border: 1px solid var(--line); border-radius: 6px; padding: 5px; font-size: 13px; text-align: center; }
+  .hint { font-size: 12px; color: var(--muted); margin-top: 8px; line-height: 1.7; }
+</style>
+</head>
+<body>
+<header>
+  <h1>拾<span>光</span></h1>
+  <div class="searchbox">
+    <input id="q" placeholder='试试:"去年在海边拍的日落"、"高铁票 截图"、"和妈妈的合影"…'
+           autocomplete="off">
+    <button onclick="doSearch()">搜索</button>
+  </div>
+  <nav>
+    <button class="ghost" id="tab-search" onclick="showTab('search')">检索</button>
+    <button class="ghost" id="tab-persons" onclick="showTab('persons')">人物</button>
+    <button class="ghost" id="tab-dupes" onclick="showTab('dupes')">去重</button>
+    <button class="ghost" id="tab-settings" onclick="showTab('settings')">设置</button>
+  </nav>
+</header>
+<main>
+  <div class="meta" id="meta"></div>
+  <div id="view"></div>
+</main>
+
+<dialog id="login" style="padding:26px 30px; min-width:300px">
+  <h1 style="margin-bottom:16px">拾<span style="color:var(--accent)">光</span> · 登录</h1>
+  <div style="display:flex; flex-direction:column; gap:10px">
+    <input id="login-user" placeholder="用户名" autocomplete="username"
+      style="background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:10px">
+    <input id="login-pass" type="password" placeholder="密码" autocomplete="current-password"
+      style="background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:10px">
+    <button onclick="doLogin()">登录</button>
+    <div id="login-err" style="color:#ff7a7a;font-size:13px;min-height:16px"></div>
+    <div class="hint">首次部署:初始密码在服务器 data/admin_initial_password.txt</div>
+  </div>
+</dialog>
+
+<dialog id="viewer">
+  <img id="viewer-img">
+  <div class="info" id="viewer-info"></div>
+  <div style="padding:0 16px 14px"><button id="btn-similar">找相似照片</button></div>
+</dialog>
+
+<script>
+const $ = s => document.querySelector(s);
+let currentTab = 'search';
+let me = { username: '', role: 'viewer' };
+
+// 统一请求封装:未登录弹出登录框
+async function api(url, opts) {
+  const r = await fetch(url, opts);
+  if (r.status === 401) { $('#login').showModal(); throw new Error('未登录'); }
+  return r;
+}
+
+async function checkAuth() {
+  try {
+    const r = await fetch('/api/me');
+    if (r.status === 401) { $('#login').showModal(); return false; }
+    me = await r.json();
+    return true;
+  } catch { return true; }
+}
+
+async function doLogin() {
+  $('#login-err').textContent = '';
+  const r = await fetch('/api/login', { method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ username: $('#login-user').value.trim(),
+                           password: $('#login-pass').value }) });
+  if (!r.ok) {
+    $('#login-err').textContent = (await r.json()).detail || '登录失败';
+    return;
+  }
+  me = await r.json();
+  $('#login').close();
+  showTab('search');
+}
+$('#login-pass') && document.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && $('#login').open) doLogin();
+});
+
+function showTab(t) {
+  currentTab = t;
+  document.querySelectorAll('nav button').forEach(b => b.classList.remove('active'));
+  $('#tab-' + t).classList.add('active');
+  if (t === 'search') renderEmpty();
+  if (t === 'persons') loadPersons();
+  if (t === 'dupes') loadDupes();
+  if (t === 'settings') renderSettings();
+}
+
+function renderEmpty() {
+  $('#meta').textContent = '';
+  $('#view').innerHTML = `<div class="empty">输入自然语言,直接搜你的本地相册<br>
+    数据全程离线,一字节不出电脑</div>`;
+}
+
+async function doSearch() {
+  const q = $('#q').value.trim();
+  if (!q) return;
+  showTab('search');
+  $('#meta').textContent = '检索中…';
+  try {
+    const r = await api('/api/search?q=' + encodeURIComponent(q));
+    if (!r.ok) throw new Error((await r.json()).detail || r.status);
+    const data = await r.json();
+    const p = data.parsed;
+    const cond = [];
+    if (p.year_from) cond.push(`${p.year_from}${p.year_to !== p.year_from ? '~' + p.year_to : ''}年`);
+    if (p.months && p.months.length) cond.push(p.months.join('/') + '月');
+    if (p.place) cond.push('地点:' + p.place);
+    if (p.person) cond.push('人物:' + p.person);
+    if (p.screenshot) cond.push('仅截图');
+    $('#meta').innerHTML =
+      `${data.count} 个结果 · ${data.latency_ms}ms · 语义:<code>${p.semantic || '-'}</code>` +
+      (cond.length ? ' · 条件:' + cond.map(c => `<span class="tag">${c}</span>`).join('') : '');
+    if (!data.results.length) {
+      $('#view').innerHTML = '<div class="empty">没有找到,换个说法试试?</div>';
+      return;
+    }
+    $('#view').innerHTML = '<div class="grid">' + data.results.map(x => `
+      <div class="card" onclick="openViewer(${x.id})">
+        <img loading="lazy" src="/api/thumb/${x.id}">
+        <div class="cap">${(x.taken_at || '').slice(0, 10)}
+          ${x.is_screenshot ? '<span class="tag">截图</span>' : ''} ${x.why || ''}</div>
+      </div>`).join('') + '</div>';
+  } catch (e) {
+    $('#meta').textContent = '';
+    $('#view').innerHTML = `<div class="empty">检索失败:${e.message}</div>`;
+  }
+}
+$('#q').addEventListener('keydown', e => { if (e.key === 'Enter') doSearch(); });
+
+async function openViewer(id) {
+  const info = await (await fetch(`/api/photo/${id}/info`)).json();
+  $('#viewer-img').src = '/api/photo/' + id;
+  $('#viewer-info').innerHTML =
+    `${info.path}<br>${info.taken_at || ''} · ${info.width}×${info.height}` +
+    (info.place ? ' · ' + info.place : '') +
+    (info.camera ? ' · ' + info.camera : '') +
+    (info.ocr ? `<br>图中文字:${info.ocr.slice(0, 160).replace(/\n/g, ' ')}` : '');
+  $('#btn-similar').onclick = () => { $('#viewer').close(); showSimilar(id); };
+  $('#viewer').showModal();
+}
+
+async function showSimilar(id) {
+  showTab('search');
+  $('#meta').textContent = '找相似中…';
+  const data = await (await api(`/api/similar/${id}`)).json();
+  $('#meta').textContent = `与所选照片视觉相似的 ${data.count} 张 · ${data.latency_ms}ms`;
+  $('#view').innerHTML = '<div class="grid">' + data.results.map(x => `
+    <div class="card" onclick="openViewer(${x.id})">
+      <img loading="lazy" src="/api/thumb/${x.id}">
+      <div class="cap">${(x.taken_at || '').slice(0, 10)} ${x.why || ''}</div>
+    </div>`).join('') + '</div>';
+}
+$('#viewer').addEventListener('click', e => { if (e.target.tagName === 'DIALOG') e.target.close(); });
+
+async function loadPersons() {
+  const list = await (await api('/api/persons')).json();
+  $('#meta').textContent = list.length ? `${list.length} 个人物(点名字可修改,命名后即可搜"和XX的合影")` : '';
+  if (!list.length) {
+    $('#view').innerHTML = '<div class="empty">还没有人物簇。完成索引且启用人脸功能后这里会出现人物。</div>';
+    return;
+  }
+  $('#view').innerHTML = '<div class="grid">' + list.map(p => `
+    <div class="card person">
+      <img loading="lazy" src="/api/thumb/${p.cover_photo}">
+      <input value="${p.name || ''}" placeholder="未命名"
+             onchange="namePerson(${p.id}, this.value)">
+      <div class="cap">${p.n_faces} 张脸</div>
+    </div>`).join('') + '</div>';
+}
+async function namePerson(id, name) {
+  await fetch(`/api/persons/${id}/name`, { method: 'POST',
+    headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ name }) });
+}
+
+async function loadDupes() {
+  $('#meta').textContent = '分析中…';
+  const data = await (await api('/api/dupes')).json();
+  $('#meta').textContent = data.total_groups ? `${data.total_groups} 组近似重复` : '';
+  if (!data.groups.length) {
+    $('#view').innerHTML = '<div class="empty">没有发现近似重复的照片</div>';
+    return;
+  }
+  $('#view').innerHTML = data.groups.map(g => `
+    <div style="margin-bottom:18px">
+      <div class="pill">1 组 × ${g.length} 张</div>
+      <div class="grid" style="margin-top:8px">${g.map(x => `
+        <div class="card" onclick="openViewer(${x.id})">
+          <img loading="lazy" src="/api/thumb/${x.id}">
+          <div class="cap">${(x.size / 1024 / 1024).toFixed(1)}MB · ${(x.taken_at || '').slice(0, 10)}</div>
+        </div>`).join('')}</div>
+    </div>`).join('');
+}
+
+async function renderSettings() {
+  const s = await (await api('/api/stats')).json();
+  $('#meta').textContent = '';
+  $('#view').innerHTML = `
+  <div class="settings">
+    <b>相册目录</b>(每行一个,保存后自动开启增量监听)
+    <textarea id="dirs">${(s.library_dirs || []).join('\n')}</textarea>
+    <div class="row">
+      <button onclick="saveDirs()">保存目录</button>
+      <button class="ghost" onclick="startIndex()">开始/继续索引</button>
+      <span class="pill">模型后端:${s.backend}</span>
+      <span class="pill">OCR:${s.ocr_available ? '✓' : '✗'}</span>
+      <span class="pill">人脸:${s.faces_available ? '✓' : '✗'}</span>
+    </div>
+    <div class="hint">已索引 ${s.total || 0} 张 · 向量 ${s.embedded || 0} · OCR ${s.ocr_done || 0}
+      · 人脸 ${s.faces_done || 0} · 截图 ${s.screenshots || 0}
+      ${s.backend === 'demo' ? '<br>⚠️ 当前是 demo 伪向量后端,请安装 torch+transformers 或导出 ONNX 模型以获得真实语义检索' : ''}
+    </div>
+    <div id="prog"></div>
+  </div>`;
+}
+async function saveDirs() {
+  const dirs = $('#dirs').value.split('\n').map(x => x.trim()).filter(Boolean);
+  const r = await fetch('/api/settings/dirs', { method: 'POST',
+    headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ dirs }) });
+  alert(r.ok ? '已保存' : '保存失败:' + (await r.json()).detail);
+}
+async function startIndex() {
+  const r = await fetch('/api/index/start', { method: 'POST' });
+  if (!r.ok) { alert((await r.json()).detail); return; }
+  const es = new EventSource('/api/index/progress');
+  const stageNames = { scan: '扫描', embed: '向量化', ocr: 'OCR', faces: '人脸',
+                       cluster: '聚类', done: '完成', error: '出错', idle: '等待' };
+  es.onmessage = ev => {
+    const p = JSON.parse(ev.data);
+    const pct = p.total ? Math.round(p.done / p.total * 100) : 0;
+    const el = $('#prog');
+    if (el) el.innerHTML = `<div class="hint">${stageNames[p.stage] || p.stage}
+      ${p.done}/${p.total} (${pct}%) · ${p.elapsed}s · 失败 ${p.errors}<br>
+      <span style="font-size:11px">${p.current || ''}</span></div>
+      <div class="bar"><i style="width:${pct}%"></i></div>`;
+    if (p.finished) { es.close(); renderSettings(); }
+  };
+}
+
+checkAuth().then(ok => { if (ok !== false) showTab('search'); });
+</script>
+</body>
+</html>

@@ -1,0 +1,33 @@
+# 拾光企业部署
+#   基础:      docker compose up -d
+#   带 pgvector: docker compose --profile pg up -d
+#              (并设 SHIGUANG_VECTOR_BACKEND=pgvector)
+services:
+  shiguang:
+    build: .
+    ports:
+      - "8626:8626"
+    volumes:
+      - shiguang-data:/data
+      - /path/to/photos:/photos:ro   # ← 改成真实图库目录(只读挂载)
+    environment:
+      SHIGUANG_LIBRARY_DIRS: /photos
+      SHIGUANG_JSON_LOGS: "true"
+      # SHIGUANG_VECTOR_BACKEND: pgvector
+      # SHIGUANG_PG_DSN: postgresql://shiguang:shiguang@pg:5432/shiguang
+    restart: unless-stopped
+
+  pg:
+    image: pgvector/pgvector:pg16
+    profiles: ["pg"]
+    environment:
+      POSTGRES_USER: shiguang
+      POSTGRES_PASSWORD: shiguang
+      POSTGRES_DB: shiguang
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+volumes:
+  shiguang-data:
+  pg-data:
