@@ -32,6 +32,7 @@ class ParsedQuery:
     person: str | None = None     # 人物名(匹配已命名的人物簇)
     place: str | None = None      # 城市名(离线逆地理,v0.9)
     screenshot: bool | None = None  # True=只要截图 / None=不限
+    intent: str = "scene"          # scene | document | person | time_location | hybrid
 
     def to_dict(self):
         return asdict(self)
@@ -39,7 +40,7 @@ class ParsedQuery:
 
 # ---------- 规则解析 ----------
 
-_RE_YEAR = re.compile(r"(20\d{2})\s*年?")
+_RE_YEAR = re.compile(r"(?<!\d)(20\d{2})\s*年?(?!\d)")
 _RE_MONTH = re.compile(r"(\d{1,2}|[一二三四五六七八九十]|十[一二])月")
 _RE_PERSON = re.compile(r"(?:和|跟|与)\s*([一-龥A-Za-z]{1,6}?)\s*(?:的)?(?:合影|合照|一起)")
 
@@ -131,7 +132,34 @@ def parse_rules(query: str, today: date | None = None) -> ParsedQuery:
 
     # OCR 关键词:语义文本里的连续中英文/数字片段都作为候选关键词
     p.keywords = [w for w in re.split(r"[\s,，。/]+", p.semantic) if len(w) >= 2][:5]
+    p.intent = classify_intent(query, p)
     return p
+
+
+_DOCUMENT_HINTS = (
+    "订单", "票", "账单", "发票", "金额", "支付", "快递", "编号", "号码",
+    "截图", "收据", "合同", "证件",
+)
+
+
+def classify_intent(query: str, parsed: ParsedQuery | None = None) -> str:
+    """可解释、低延迟的查询意图分类，不依赖在线大模型。"""
+    p = parsed or ParsedQuery()
+    has_document = any(x in query for x in _DOCUMENT_HINTS) or bool(
+        re.search(r"[A-Za-z]*\d{4,}", query)
+    )
+    has_metadata = bool(p.year_from or p.months or p.place)
+    has_person = bool(p.person)
+    active = sum((has_document, has_metadata, has_person))
+    if active > 1:
+        return "hybrid"
+    if has_document:
+        return "document"
+    if has_person:
+        return "person"
+    if has_metadata:
+        return "time_location"
+    return "scene"
 
 
 # ---------- Ollama 解析(可选) ----------
@@ -174,6 +202,7 @@ def parse_ollama(query: str, host: str, model: str, today: date | None = None) -
     p.person = raw.get("person") or None
     p.place = raw.get("place") or None
     p.screenshot = raw.get("screenshot") if isinstance(raw.get("screenshot"), bool) else None
+    p.intent = classify_intent(query, p)
     return p
 
 

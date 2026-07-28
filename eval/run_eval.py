@@ -78,6 +78,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--testset", default=str(Path(__file__).parent / "testset.csv"))
     ap.add_argument("--tag", default=None, help="结果存档名")
+    ap.add_argument(
+        "--mode", choices=("clip_only", "ocr_only", "fixed", "dynamic"),
+        default="dynamic", help="消融实验检索方案",
+    )
     ap.add_argument("--compare", nargs=2, metavar=("A", "B"), help="对比两次存档")
     args = ap.parse_args()
 
@@ -98,9 +102,11 @@ def main():
         print("测试集为空:先运行 python eval/build_testset.py 并填写答案")
         return
     cfg = Config.load()
+    cfg.fusion_mode = args.mode
     db = DB(get_paths()["db"])
     engine = SearchEngine(db, create_embedder(cfg), cfg)
     report = evaluate(cases, engine, cfg)
+    report["mode"] = args.mode
 
     print(json.dumps({k: v for k, v in report.items() if k != "misses"},
                      ensure_ascii=False, indent=2))

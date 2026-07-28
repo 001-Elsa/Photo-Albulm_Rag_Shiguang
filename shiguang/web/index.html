@@ -8,6 +8,7 @@
   :root {
     --bg: #101214; --panel: #191c1f; --line: #2a2e33;
     --text: #e8eaed; --muted: #9aa0a6; --accent: #4f8cff;
+    --danger: #ff6b6b; --success: #4ecb71;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { background: var(--bg); color: var(--text);
@@ -22,9 +23,10 @@
     color: var(--text); border-radius: 10px; padding: 10px 14px; font-size: 15px; outline: none; }
   .searchbox input:focus { border-color: var(--accent); }
   button { background: var(--accent); color: #fff; border: 0; border-radius: 10px;
-           padding: 10px 18px; font-size: 14px; cursor: pointer; }
+           padding: 10px 18px; font-size: 14px; cursor: pointer; transition: filter .15s; }
   button.ghost { background: transparent; color: var(--muted); border: 1px solid var(--line); }
-  button:hover { filter: brightness(1.1); }
+  button:hover { filter: brightness(1.15); }
+  button:disabled { opacity: 0.5; cursor: not-allowed; filter: none; }
   nav { display: flex; gap: 6px; }
   nav button.active { background: var(--panel); color: var(--accent); border: 1px solid var(--accent); }
   main { padding: 18px 20px; max-width: 1500px; margin: 0 auto; }
@@ -51,16 +53,105 @@
               padding: 18px; max-width: 720px; }
   .settings textarea { width: 100%; height: 90px; background: var(--bg); color: var(--text);
     border: 1px solid var(--line); border-radius: 8px; padding: 10px; font-size: 14px; }
-  .settings .row { display: flex; gap: 10px; margin-top: 12px; align-items: center; }
+  .settings .row { display: flex; gap: 10px; margin-top: 12px; align-items: center; flex-wrap: wrap; }
   .pill { font-size: 12px; color: var(--muted); border: 1px solid var(--line);
           padding: 3px 10px; border-radius: 99px; }
   .person { text-align: center; }
   .person input { width: 90%; margin: 6px 0; background: var(--bg); color: var(--text);
     border: 1px solid var(--line); border-radius: 6px; padding: 5px; font-size: 13px; text-align: center; }
   .hint { font-size: 12px; color: var(--muted); margin-top: 8px; line-height: 1.7; }
+
+  /* ====== 认证页面 ====== */
+  .auth-page { display: flex; align-items: center; justify-content: center;
+               min-height: 100vh; padding: 20px; }
+  .auth-card { background: var(--panel); border: 1px solid var(--line); border-radius: 16px;
+               padding: 36px 32px; width: 100%; max-width: 400px; }
+  .auth-card .brand { text-align: center; margin-bottom: 28px; }
+  .auth-card .brand h1 { font-size: 26px; letter-spacing: 4px; }
+  .auth-card .brand p { color: var(--muted); font-size: 13px; margin-top: 6px; }
+  .auth-tabs { display: flex; gap: 0; margin-bottom: 24px; border-radius: 10px;
+               background: var(--bg); border: 1px solid var(--line); overflow: hidden; }
+  .auth-tabs button { flex: 1; background: transparent; color: var(--muted);
+    border: none; border-radius: 0; padding: 11px; font-size: 14px; cursor: pointer; transition: all .2s; }
+  .auth-tabs button.active { background: var(--accent); color: #fff; }
+  .auth-form { display: flex; flex-direction: column; gap: 14px; }
+  .auth-form label { font-size: 13px; color: var(--muted); }
+  .auth-form input { width: 100%; background: var(--bg); color: var(--text);
+    border: 1px solid var(--line); border-radius: 10px; padding: 11px 14px;
+    font-size: 15px; outline: none; transition: border-color .2s; }
+  .auth-form input:focus { border-color: var(--accent); }
+  .auth-form .err { color: var(--danger); font-size: 13px; min-height: 18px; line-height: 1.5; }
+  .auth-form .ok { color: var(--success); font-size: 13px; min-height: 18px; line-height: 1.5; }
+  .auth-form button[type=submit] { width: 100%; padding: 12px; font-size: 15px; font-weight: 500; }
+  .auth-form .divider { display: flex; align-items: center; gap: 12px; color: var(--muted);
+                         font-size: 12px; margin: 4px 0; }
+  .auth-form .divider::before, .auth-form .divider::after { content: ''; flex: 1;
+    height: 1px; background: var(--line); }
+  .auth-form .switch-text { text-align: center; font-size: 13px; color: var(--muted); }
+  .auth-form .switch-text button { background: none; border: none; color: var(--accent);
+    font-size: 13px; cursor: pointer; padding: 2px 4px; text-decoration: underline; }
+  .auth-form .switch-text button:hover { filter: brightness(1.2); }
+
+  .user-bar { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+  .user-bar .uname { font-size: 13px; color: var(--accent); }
 </style>
 </head>
 <body>
+
+<!-- ====== 认证页面 ====== -->
+<div id="auth-page" class="auth-page" style="display:none">
+  <div class="auth-card">
+    <div class="brand">
+      <h1>拾<span>光</span></h1>
+      <p>本地相册第二大脑 · 数据全程离线</p>
+    </div>
+    <div class="auth-tabs" id="auth-tabs">
+      <button id="tab-login-btn" class="active">登录</button>
+      <button id="tab-register-btn">注册</button>
+    </div>
+
+    <!-- 登录表单 -->
+    <form id="login-form" class="auth-form" onsubmit="return false">
+      <div>
+        <input id="login-user" type="text" placeholder="用户名" autocomplete="username" required>
+      </div>
+      <div>
+        <input id="login-pass" type="password" placeholder="密码" autocomplete="current-password" required>
+      </div>
+      <div class="err" id="login-err"></div>
+      <button type="submit" onclick="doLogin()">登 录</button>
+      <div class="switch-text">
+        还没有账号？
+        <button type="button" onclick="switchAuthTab('register')">立即注册</button>
+      </div>
+    </form>
+
+    <!-- 注册表单 -->
+    <form id="register-form" class="auth-form" style="display:none" onsubmit="return false">
+      <div>
+        <input id="reg-user" type="text" placeholder="用户名（字母数字下划线，2-32位）"
+               autocomplete="username" required>
+      </div>
+      <div>
+        <input id="reg-pass" type="password" placeholder="密码（至少 8 位）"
+               autocomplete="new-password" required>
+      </div>
+      <div>
+        <input id="reg-pass2" type="password" placeholder="确认密码" required>
+      </div>
+      <div class="err" id="reg-err"></div>
+      <div class="ok" id="reg-ok"></div>
+      <button type="submit" onclick="doRegister()">注 册</button>
+      <div class="switch-text">
+        已有账号？
+        <button type="button" onclick="switchAuthTab('login')">去登录</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- ====== 主应用 ====== -->
+<div id="app-page" style="display:none">
 <header>
   <h1>拾<span>光</span></h1>
   <div class="searchbox">
@@ -74,25 +165,18 @@
     <button class="ghost" id="tab-dupes" onclick="showTab('dupes')">去重</button>
     <button class="ghost" id="tab-settings" onclick="showTab('settings')">设置</button>
   </nav>
+  <div class="user-bar">
+    <span class="uname" id="current-user"></span>
+    <button class="ghost" onclick="doLogout()" style="font-size:12px;padding:6px 12px">退出</button>
+  </div>
 </header>
 <main>
   <div class="meta" id="meta"></div>
   <div id="view"></div>
 </main>
+</div>
 
-<dialog id="login" style="padding:26px 30px; min-width:300px">
-  <h1 style="margin-bottom:16px">拾<span style="color:var(--accent)">光</span> · 登录</h1>
-  <div style="display:flex; flex-direction:column; gap:10px">
-    <input id="login-user" placeholder="用户名" autocomplete="username"
-      style="background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:10px">
-    <input id="login-pass" type="password" placeholder="密码" autocomplete="current-password"
-      style="background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:10px">
-    <button onclick="doLogin()">登录</button>
-    <div id="login-err" style="color:#ff7a7a;font-size:13px;min-height:16px"></div>
-    <div class="hint">首次部署:初始密码在服务器 data/admin_initial_password.txt</div>
-  </div>
-</dialog>
-
+<!-- 相册查看器 -->
 <dialog id="viewer">
   <img id="viewer-img">
   <div class="info" id="viewer-info"></div>
@@ -102,46 +186,176 @@
 <script>
 const $ = s => document.querySelector(s);
 let currentTab = 'search';
-let me = { username: '', role: 'viewer' };
+let me = null;
 
-// 统一请求封装:未登录弹出登录框
+/* ====== 认证页面切换 ====== */
+function switchAuthTab(tab) {
+  const isLogin = tab === 'login';
+  $('#tab-login-btn').classList.toggle('active', isLogin);
+  $('#tab-register-btn').classList.toggle('active', !isLogin);
+  $('#login-form').style.display = isLogin ? '' : 'none';
+  $('#register-form').style.display = isLogin ? 'none' : '';
+  $('#login-err').textContent = '';
+  $('#reg-err').textContent = '';
+  $('#reg-ok').textContent = '';
+}
+$('#tab-login-btn').addEventListener('click', () => switchAuthTab('login'));
+$('#tab-register-btn').addEventListener('click', () => switchAuthTab('register'));
+
+/* ====== 页面显示切换 ====== */
+function showAuthPage() {
+  $('#auth-page').style.display = '';
+  $('#app-page').style.display = 'none';
+  me = null;
+}
+
+function showAppPage() {
+  $('#auth-page').style.display = 'none';
+  $('#app-page').style.display = '';
+  $('#current-user').textContent = me ? me.username : '';
+}
+
+/* ====== API 封装 ====== */
 async function api(url, opts) {
   const r = await fetch(url, opts);
-  if (r.status === 401) { $('#login').showModal(); throw new Error('未登录'); }
+  if (r.status === 401) {
+    showAuthPage();
+    throw new Error('未登录');
+  }
   return r;
 }
 
+/* ====== 登录 ====== */
+async function doLogin() {
+  $('#login-err').textContent = '';
+  const btn = $('#login-form').querySelector('button[type=submit]');
+  btn.disabled = true; btn.textContent = '登录中…';
+
+  const username = $('#login-user').value.trim();
+  const password = $('#login-pass').value;
+  if (!username || !password) {
+    $('#login-err').textContent = '请填写用户名和密码';
+    btn.disabled = false; btn.textContent = '登 录';
+    return;
+  }
+
+  try {
+    const r = await fetch('/api/login', { method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ username, password }) });
+    const data = await r.json();
+    if (!r.ok) {
+      $('#login-err').textContent = data.detail || '登录失败';
+      btn.disabled = false; btn.textContent = '登 录';
+      return;
+    }
+    me = { username: data.username, role: data.role };
+    showAppPage();
+    showTab('search');
+  } catch (e) {
+    $('#login-err').textContent = '网络错误,请重试';
+    btn.disabled = false; btn.textContent = '登 录';
+  }
+}
+
+/* ====== 注册 ====== */
+async function doRegister() {
+  $('#reg-err').textContent = '';
+  $('#reg-ok').textContent = '';
+  const btn = $('#register-form').querySelector('button[type=submit]');
+  btn.disabled = true; btn.textContent = '注册中…';
+
+  const username = $('#reg-user').value.trim();
+  const password = $('#reg-pass').value;
+  const password2 = $('#reg-pass2').value;
+
+  if (!username || !password || !password2) {
+    $('#reg-err').textContent = '请填写所有字段';
+    btn.disabled = false; btn.textContent = '注 册';
+    return;
+  }
+  if (username.length < 2 || username.length > 32) {
+    $('#reg-err').textContent = '用户名需要 2-32 个字符';
+    btn.disabled = false; btn.textContent = '注 册';
+    return;
+  }
+  if (!/^[a-zA-Z0-9_\-一-鿿]+$/.test(username)) {
+    $('#reg-err').textContent = '用户名只允许字母、数字、下划线、连字符和中文';
+    btn.disabled = false; btn.textContent = '注 册';
+    return;
+  }
+  if (password.length < 8) {
+    $('#reg-err').textContent = '密码至少 8 位';
+    btn.disabled = false; btn.textContent = '注 册';
+    return;
+  }
+  if (password !== password2) {
+    $('#reg-err').textContent = '两次输入的密码不一致';
+    btn.disabled = false; btn.textContent = '注 册';
+    return;
+  }
+
+  try {
+    const r = await fetch('/api/register', { method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ username, password }) });
+    const data = await r.json();
+    if (!r.ok) {
+      $('#reg-err').textContent = data.detail || '注册失败';
+      btn.disabled = false; btn.textContent = '注 册';
+      return;
+    }
+    // 注册成功,自动登录
+    $('#reg-ok').textContent = '注册成功,跳转中…';
+    setTimeout(() => {
+      me = { username: data.username, role: data.role };
+      showAppPage();
+      showTab('search');
+    }, 600);
+  } catch (e) {
+    $('#reg-err').textContent = '网络错误,请重试';
+    btn.disabled = false; btn.textContent = '注 册';
+  }
+}
+
+/* ====== 退出 ====== */
+async function doLogout() {
+  await fetch('/api/logout', { method: 'POST' });
+  me = null;
+  showAuthPage();
+  switchAuthTab('login');
+}
+
+/* ====== 键盘快捷键 ====== */
+document.addEventListener('keydown', e => {
+  if (e.key === 'Enter') {
+    const authVisible = $('#auth-page').style.display !== 'none';
+    if (authVisible) {
+      if ($('#register-form').style.display !== 'none') {
+        doRegister();
+      } else {
+        doLogin();
+      }
+    }
+  }
+});
+
+/* ====== 主应用逻辑 ====== */
 async function checkAuth() {
   try {
     const r = await fetch('/api/me');
-    if (r.status === 401) { $('#login').showModal(); return false; }
+    if (!r.ok) { showAuthPage(); return false; }
     me = await r.json();
+    showAppPage();
     return true;
-  } catch { return true; }
+  } catch { showAuthPage(); return false; }
 }
-
-async function doLogin() {
-  $('#login-err').textContent = '';
-  const r = await fetch('/api/login', { method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({ username: $('#login-user').value.trim(),
-                           password: $('#login-pass').value }) });
-  if (!r.ok) {
-    $('#login-err').textContent = (await r.json()).detail || '登录失败';
-    return;
-  }
-  me = await r.json();
-  $('#login').close();
-  showTab('search');
-}
-$('#login-pass') && document.addEventListener('keydown', e => {
-  if (e.key === 'Enter' && $('#login').open) doLogin();
-});
 
 function showTab(t) {
   currentTab = t;
   document.querySelectorAll('nav button').forEach(b => b.classList.remove('active'));
-  $('#tab-' + t).classList.add('active');
+  const el = $('#tab-' + t);
+  if (el) el.classList.add('active');
   if (t === 'search') renderEmpty();
   if (t === 'persons') loadPersons();
   if (t === 'dupes') loadDupes();
@@ -299,7 +513,8 @@ async function startIndex() {
   };
 }
 
-checkAuth().then(ok => { if (ok !== false) showTab('search'); });
+/* ====== 启动 ====== */
+checkAuth().then(ok => { if (ok) showTab('search'); });
 </script>
 </body>
 </html>

@@ -30,10 +30,14 @@ class Config:
     # 向量模型: auto | onnx | transformers | demo
     embed_backend: str = "auto"
     embed_model: str = "OFA-Sys/chinese-clip-vit-base-patch16"
+    embed_version: str = "1"
     onnx_dir: str = str(PROJECT_ROOT / "models")
     # OCR / 人脸开关(重依赖,可关)
     enable_ocr: bool = True
     enable_faces: bool = True
+    ocr_version: str = "rapidocr-1"
+    face_model: str = "insightface-buffalo_l"
+    face_version: str = "1"
     # 查询解析: rules | ollama(需本地 ollama 服务)
     query_parser: str = "rules"
     ollama_host: str = "http://127.0.0.1:11434"
@@ -43,8 +47,11 @@ class Config:
     rrf_k: int = 60
     weight_semantic: float = 1.0
     weight_ocr: float = 0.8
+    fusion_mode: str = "dynamic"     # clip_only | ocr_only | fixed | dynamic
     # 索引批大小
     embed_batch: int = 16
+    inference_concurrency: int = 2
+    index_max_retries: int = 3
     # 服务
     host: str = "127.0.0.1"
     port: int = 8626

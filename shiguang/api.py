@@ -35,7 +35,7 @@ from .search import SearchEngine
 log = logging.getLogger("shiguang.api")
 WEB_DIR = Path(__file__).parent / "web"
 
-PUBLIC_PATHS = {"/", "/api/login", "/healthz", "/metrics", "/favicon.ico"}
+PUBLIC_PATHS = {"/", "/api/login", "/api/register", "/healthz", "/metrics", "/favicon.ico"}
 ADMIN_PREFIXES = ("/api/settings", "/api/index/start", "/api/users", "/api/audit")
 
 
@@ -48,6 +48,11 @@ class NameBody(BaseModel):
 
 
 class LoginBody(BaseModel):
+    username: str
+    password: str
+
+
+class RegisterBody(BaseModel):
     username: str
     password: str
 
@@ -121,8 +126,24 @@ def create_app() -> FastAPI:
     def healthz():
         try:
             db.query("SELECT 1")
-            return {"status": "ok", "version": __version__,
-                    "schema": db.schema_version, "vector": engine.vindex.stats()}
+            semantic_ready = embedder.name != "demo"
+            ocr_ready = bool(cfg.enable_ocr and getattr(ocr_engine, "available", False))
+            face_ready = bool(cfg.enable_faces and getattr(face_engine, "available", False))
+            status = "ok" if semantic_ready and (
+                not cfg.enable_ocr or ocr_ready
+            ) and (not cfg.enable_faces or face_ready) else "degraded"
+            return {
+                "status": status,
+                "version": __version__,
+                "schema": db.schema_version,
+                "database": "ready",
+                "embedder": embedder.name,
+                "semantic_search_ready": semantic_ready,
+                "ocr_ready": ocr_ready,
+                "face_search_ready": face_ready,
+                "vector": engine.vindex.stats(),
+                "index_jobs": db.job_stats(),
+            }
         except Exception as e:
             return JSONResponse({"status": "error", "detail": str(e)}, status_code=503)
 
@@ -145,6 +166,33 @@ def create_app() -> FastAPI:
         token = auth.sign_token(secret, user["username"], user["role"])
         db.audit(user["username"], "login", "")
         resp = JSONResponse({"ok": True, "username": user["username"], "role": user["role"]})
+        resp.set_cookie("sg_token", token, httponly=True, samesite="lax",
+                        max_age=auth.TOKEN_TTL)
+        return resp
+
+    @app.post("/api/register")
+    def register(body: RegisterBody, request: Request):
+        if not cfg.auth_enabled:
+            raise HTTPException(400, "认证未启用")
+        username = body.username.strip()
+        password = body.password
+        if len(username) < 2:
+            raise HTTPException(400, "用户名至少 2 个字符")
+        if len(username) > 32:
+            raise HTTPException(400, "用户名最多 32 个字符")
+        if len(username) != len(username.encode("utf-8").decode("utf-8")):
+            raise HTTPException(400, "用户名包含非法字符")
+        if any(c.isspace() for c in username):
+            raise HTTPException(400, "用户名不能包含空格")
+        if len(password) < 8:
+            raise HTTPException(400, "密码至少 8 位")
+        if db.get_user(username):
+            raise HTTPException(400, "用户名已存在")
+        pwd_hash = auth.hash_password(password)
+        db.create_user(username, pwd_hash, role="viewer")
+        db.audit(username, "register", request.client.host if request.client else "")
+        token = auth.sign_token(secret, username, "viewer")
+        resp = JSONResponse({"ok": True, "username": username, "role": "viewer"})
         resp.set_cookie("sg_token", token, httponly=True, samesite="lax",
                         max_age=auth.TOKEN_TTL)
         return resp
@@ -253,7 +301,10 @@ def create_app() -> FastAPI:
         if not rows:
             raise HTTPException(404)
         info = dict(rows[0])
-        ocr_rows = db.query("SELECT text FROM ocr_text WHERE photo_id=?", (photo_id,))
+        ocr_rows = db.query(
+            "SELECT COALESCE(raw_text, text) AS text FROM ocr_text WHERE photo_id=?",
+            (photo_id,),
+        )
         info["ocr"] = ocr_rows[0]["text"] if ocr_rows else ""
         return info
 
@@ -291,6 +342,7 @@ def create_app() -> FastAPI:
         s["faces_available"] = getattr(face_engine, "available", False)
         s["library_dirs"] = cfg.library_dirs
         s["version"] = __version__
+        s["index_jobs"] = db.job_stats()
         return s
 
     # ---------- 设置(admin) ----------

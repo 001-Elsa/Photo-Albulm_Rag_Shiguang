@@ -105,9 +105,46 @@ CREATE TABLE IF NOT EXISTS audit_log (
 CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts);
 """
 
+_M003_RELIABLE_INDEXING = """
+ALTER TABLE embeddings ADD COLUMN model_name TEXT;
+ALTER TABLE embeddings ADD COLUMN model_version TEXT;
+ALTER TABLE embeddings ADD COLUMN content_hash TEXT;
+ALTER TABLE embeddings ADD COLUMN updated_at REAL;
+
+ALTER TABLE ocr_text ADD COLUMN raw_text TEXT;
+ALTER TABLE ocr_text ADD COLUMN engine_name TEXT;
+ALTER TABLE ocr_text ADD COLUMN engine_version TEXT;
+ALTER TABLE ocr_text ADD COLUMN content_hash TEXT;
+ALTER TABLE ocr_text ADD COLUMN updated_at REAL;
+
+CREATE TABLE IF NOT EXISTS index_jobs (
+    id                INTEGER PRIMARY KEY,
+    photo_id          INTEGER REFERENCES photos(id) ON DELETE CASCADE,
+    photo_path        TEXT NOT NULL,
+    task_type         TEXT NOT NULL CHECK(task_type IN ('scan', 'embedding', 'ocr', 'face')),
+    status            TEXT NOT NULL DEFAULT 'pending'
+                      CHECK(status IN ('pending', 'running', 'succeeded', 'failed', 'skipped')),
+    retry_count       INTEGER NOT NULL DEFAULT 0,
+    priority          INTEGER NOT NULL DEFAULT 0,
+    last_error        TEXT,
+    processor_name    TEXT NOT NULL,
+    processor_version TEXT NOT NULL,
+    content_hash      TEXT,
+    created_at        REAL NOT NULL,
+    updated_at        REAL NOT NULL,
+    started_at        REAL,
+    finished_at       REAL,
+    UNIQUE(photo_path, task_type, processor_version)
+);
+CREATE INDEX IF NOT EXISTS idx_index_jobs_claim
+    ON index_jobs(task_type, status, priority DESC, created_at);
+CREATE INDEX IF NOT EXISTS idx_index_jobs_photo ON index_jobs(photo_id);
+"""
+
 MIGRATIONS: list[tuple[int, str]] = [
     (1, _M001_BASE),
     (2, _M002_AUTH),
+    (3, _M003_RELIABLE_INDEXING),
 ]
 
 LATEST = max(v for v, _ in MIGRATIONS)

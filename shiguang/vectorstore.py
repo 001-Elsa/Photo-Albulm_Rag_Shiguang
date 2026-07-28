@@ -7,8 +7,8 @@
 
 选型逻辑:
 - local    个人/单机部署,10 万级以内,内存矩阵暴力点积,零依赖
-- pgvector 企业部署,百万级,PostgreSQL + pgvector 扩展(HNSW 索引),
-           元数据与向量同库,事务一致
+- pgvector 实验适配,PostgreSQL + pgvector 扩展(HNSW 索引)。
+  尚未在本仓库证明具体容量和高并发能力。
 换 Milvus 时同样实现这三个方法即可(阶段 2)。
 """
 from __future__ import annotations
@@ -19,6 +19,10 @@ import threading
 import numpy as np
 
 log = logging.getLogger("shiguang.vectorstore")
+
+
+def _vector_literal(vec) -> str:
+    return "[" + ",".join(str(float(x)) for x in vec) + "]"
 
 
 class LocalVectorStore:
@@ -69,11 +73,10 @@ class LocalVectorStore:
 
 
 class PgVectorStore:
-    """PostgreSQL + pgvector 适配器(企业部署,百万级)。
+    """PostgreSQL + pgvector 实验性适配器。
 
     需要:pip install psycopg[binary];Postgres 已建扩展 CREATE EXTENSION vector。
-    向量写入走 sync_from_sqlite()(阶段 1 先做旁路同步,阶段 2 索引管线直写)。
-    注意:此适配器需要真实 Postgres 环境联调,离线环境仅保证接口与 SQL 正确性评审。
+    当前为实验性旁路同步适配，使用内容哈希和模型版本判断是否更新。
     """
 
     name = "pgvector"
@@ -89,9 +92,17 @@ class PgVectorStore:
             cur.execute(
                 f"""CREATE TABLE IF NOT EXISTS photo_vectors (
                         photo_id BIGINT PRIMARY KEY,
-                        vec vector({dim})
+                        vec vector({dim}),
+                        model_name TEXT,
+                        model_version TEXT,
+                        content_hash TEXT,
+                        updated_at DOUBLE PRECISION
                     )"""
             )
+            cur.execute("ALTER TABLE photo_vectors ADD COLUMN IF NOT EXISTS model_name TEXT")
+            cur.execute("ALTER TABLE photo_vectors ADD COLUMN IF NOT EXISTS model_version TEXT")
+            cur.execute("ALTER TABLE photo_vectors ADD COLUMN IF NOT EXISTS content_hash TEXT")
+            cur.execute("ALTER TABLE photo_vectors ADD COLUMN IF NOT EXISTS updated_at DOUBLE PRECISION")
             cur.execute(
                 """CREATE INDEX IF NOT EXISTS idx_photo_vectors_hnsw
                    ON photo_vectors USING hnsw (vec vector_cosine_ops)"""
@@ -102,22 +113,33 @@ class PgVectorStore:
         self.sync_from_sqlite()
 
     def sync_from_sqlite(self):
-        """把 SQLite 里新增的向量批量同步到 Postgres。"""
+        """同步新增或内容/模型版本已变化的向量。"""
         rows = self.db.all_embeddings()
         if not rows:
             return
         with self.conn.cursor() as cur:
-            cur.execute("SELECT photo_id FROM photo_vectors")
-            have = {r[0] for r in cur.fetchall()}
-            todo = [r for r in rows if r["photo_id"] not in have]
+            cur.execute("SELECT photo_id, content_hash, model_version FROM photo_vectors")
+            have = {r[0]: (r[1], r[2]) for r in cur.fetchall()}
+            todo = [
+                r for r in rows
+                if have.get(r["photo_id"]) != (r["content_hash"], r["model_version"])
+            ]
             for r in todo:
                 v = np.frombuffer(r["vec"], dtype=np.float32)
                 if v.shape[0] != self.dim:
                     continue
                 cur.execute(
-                    "INSERT INTO photo_vectors (photo_id, vec) VALUES (%s, %s) "
-                    "ON CONFLICT (photo_id) DO UPDATE SET vec=EXCLUDED.vec",
-                    (r["photo_id"], list(map(float, v))),
+                    """INSERT INTO photo_vectors
+                           (photo_id, vec, model_name, model_version, content_hash, updated_at)
+                       VALUES (%s, %s::vector, %s, %s, %s, %s)
+                       ON CONFLICT (photo_id) DO UPDATE SET
+                           vec=EXCLUDED.vec, model_name=EXCLUDED.model_name,
+                           model_version=EXCLUDED.model_version,
+                           content_hash=EXCLUDED.content_hash, updated_at=EXCLUDED.updated_at""",
+                    (
+                        r["photo_id"], _vector_literal(v), r["model_name"],
+                        r["model_version"], r["content_hash"], r["updated_at"],
+                    ),
                 )
         log.info("pgvector 同步完成: +%d", len(todo))
 
@@ -126,7 +148,7 @@ class PgVectorStore:
             cur.execute(
                 "SELECT photo_id, 1 - (vec <=> %s::vector) AS score "
                 "FROM photo_vectors ORDER BY vec <=> %s::vector LIMIT %s",
-                (list(map(float, qvec)), list(map(float, qvec)), top_k),
+                (_vector_literal(qvec), _vector_literal(qvec), top_k),
             )
             return [(int(r[0]), float(r[1])) for r in cur.fetchall()]
 

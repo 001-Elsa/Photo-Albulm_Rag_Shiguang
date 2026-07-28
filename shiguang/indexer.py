@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import logging
-import queue
 import threading
 import time
 from pathlib import Path
@@ -15,6 +14,7 @@ from PIL import Image
 
 from . import scanner
 from .config import IMAGE_EXTS, get_paths
+from .ocr import build_ocr_index_text
 
 log = logging.getLogger("shiguang.indexer")
 
@@ -61,8 +61,31 @@ class Indexer:
         self.vindex = vindex
         self.progress = Progress()
         self._running = threading.Event()
-        self._watch_queue: queue.Queue[str] = queue.Queue()
+        self._watch_wakeup = threading.Event()
         self._observer = None
+
+    @property
+    def _embed_version(self) -> str:
+        return f"{self.cfg.embed_version}:{self.embedder.name}:{self.embedder.dim}"
+
+    def _enqueue_processors(self, row, priority: int = 0):
+        pid, path, content_hash = row["id"], row["path"], row["sha1"]
+        self.db.enqueue_job(
+            pid, path, "embedding", self.cfg.embed_model, self._embed_version,
+            content_hash, priority=priority,
+        )
+        self.db.enqueue_job(
+            pid, path, "ocr", "rapidocr", self.cfg.ocr_version, content_hash,
+            enabled=bool(self.cfg.enable_ocr and self.ocr.available), priority=priority,
+        )
+        self.db.enqueue_job(
+            pid, path, "face", self.cfg.face_model, self.cfg.face_version, content_hash,
+            enabled=bool(self.cfg.enable_faces and self.faces.available), priority=priority,
+        )
+
+    def _ensure_jobs(self):
+        for row in self.db.query("SELECT id, path, sha1 FROM photos WHERE status!='missing'"):
+            self._enqueue_processors(row)
 
     # ---------- 全量/断点 索引 ----------
     def run_full(self):
@@ -75,6 +98,7 @@ class Indexer:
         self.progress.update(started_at=time.time())
         try:
             self._stage_scan()
+            self._ensure_jobs()
             self._stage_embed()
             self._stage_ocr()
             self._stage_faces()
@@ -106,6 +130,8 @@ class Indexer:
                 continue
             pid = self.db.upsert_photo(meta)
             self.db.mark_ready(pid)
+            row = self.db.query("SELECT id, path, sha1 FROM photos WHERE id=?", (pid,))[0]
+            self._enqueue_processors(row)
             self.progress.update(done=i + 1, current=p.name)
         # 标记已删除的文件
         for r in self.db.query("SELECT path FROM photos WHERE status!='missing'"):
@@ -123,11 +149,18 @@ class Indexer:
                 self.db.execute("UPDATE photos SET place=? WHERE id=?", (city, r["id"]))
 
     def _stage_embed(self):
-        total = self.db.count_pending("embedded")
+        total = len(self.db.query(
+            """SELECT id FROM index_jobs WHERE task_type='embedding'
+               AND processor_version=? AND status IN ('pending','failed')""",
+            (self._embed_version,),
+        ))
         self.progress.update(stage="embed", total=total, done=0)
         done = 0
         while True:
-            rows = self.db.pending("embedded", limit=self.cfg.embed_batch)
+            rows = self.db.claim_jobs(
+                "embedding", self._embed_version, self.cfg.embed_batch,
+                self.cfg.index_max_retries,
+            )
             if not rows:
                 break
             imgs, ok_rows = [], []
@@ -137,13 +170,24 @@ class Indexer:
                     im.load()
                     imgs.append(im)
                     ok_rows.append(r)
-                except Exception:
-                    self.db.mark_done(r["id"], "embedded")  # 打不开也标完成,避免死循环
+                except Exception as e:
+                    self.db.finish_job(r["job_id"], "failed", str(e))
                     self.progress.update(errors=self.progress.errors + 1)
             if imgs:
-                vecs = self.embedder.encode_images(imgs)
+                gate = getattr(self.embedder, "_inference_gate", None)
+                if gate is None:
+                    gate = self.embedder._inference_gate = threading.BoundedSemaphore(
+                        max(1, self.cfg.inference_concurrency)
+                    )
+                with gate:
+                    vecs = self.embedder.encode_images(imgs)
                 for r, v in zip(ok_rows, vecs):
-                    self.db.save_embedding(r["id"], v.astype("float32").tobytes(), v.shape[0])
+                    self.db.save_embedding(
+                        r["id"], v.astype("float32").tobytes(), v.shape[0],
+                        model_name=self.cfg.embed_model,
+                        model_version=self._embed_version,
+                        content_hash=r["content_hash"], job_id=r["job_id"],
+                    )
                 for im in imgs:
                     im.close()
             done += len(rows)
@@ -151,13 +195,18 @@ class Indexer:
 
     def _stage_ocr(self):
         if not (self.cfg.enable_ocr and self.ocr.available):
-            self.db.execute("UPDATE photos SET ocr_done=1 WHERE ocr_done=0")
             return
-        total = self.db.count_pending("ocr_done")
+        total = len(self.db.query(
+            """SELECT id FROM index_jobs WHERE task_type='ocr'
+               AND processor_version=? AND status IN ('pending','failed')""",
+            (self.cfg.ocr_version,),
+        ))
         self.progress.update(stage="ocr", total=total, done=0)
         done = 0
         while True:
-            rows = self.db.pending("ocr_done", limit=50)
+            rows = self.db.claim_jobs(
+                "ocr", self.cfg.ocr_version, 50, self.cfg.index_max_retries,
+            )
             if not rows:
                 break
             for r in rows:
@@ -167,36 +216,45 @@ class Indexer:
                         if not r["is_screenshot"]:
                             im.thumbnail((1600, 1600))
                         text = self.ocr.extract(im)
-                    self.db.save_ocr(r["id"], text)
-                except Exception:
-                    self.db.mark_done(r["id"], "ocr_done")
+                    self.db.save_ocr(
+                        r["id"], text, indexed_text=build_ocr_index_text(text),
+                        engine_name="rapidocr", engine_version=self.cfg.ocr_version,
+                        content_hash=r["content_hash"], job_id=r["job_id"],
+                    )
+                except Exception as e:
+                    self.db.finish_job(r["job_id"], "failed", str(e))
                     self.progress.update(errors=self.progress.errors + 1)
                 done += 1
                 self.progress.update(done=done, current=r["path"])
 
     def _stage_faces(self):
         if not (self.cfg.enable_faces and self.faces.available):
-            self.db.execute("UPDATE photos SET faces_done=1 WHERE faces_done=0")
             return
         from .faces import recluster_all
 
-        total = self.db.count_pending("faces_done")
+        total = len(self.db.query(
+            """SELECT id FROM index_jobs WHERE task_type='face'
+               AND processor_version=? AND status IN ('pending','failed')""",
+            (self.cfg.face_version,),
+        ))
         self.progress.update(stage="faces", total=total, done=0)
         done = 0
         new_faces = False
         while True:
-            rows = self.db.pending("faces_done", limit=50)
+            rows = self.db.claim_jobs(
+                "face", self.cfg.face_version, 50, self.cfg.index_max_retries,
+            )
             if not rows:
                 break
             for r in rows:
                 try:
                     with Image.open(r["path"]) as im:
                         found = self.faces.detect(im)
-                    self.db.save_faces(r["id"], found)
+                    self.db.save_faces(r["id"], found, job_id=r["job_id"])
                     if found:
                         new_faces = True
-                except Exception:
-                    self.db.mark_done(r["id"], "faces_done")
+                except Exception as e:
+                    self.db.finish_job(r["job_id"], "failed", str(e))
                     self.progress.update(errors=self.progress.errors + 1)
                 done += 1
                 self.progress.update(done=done, current=r["path"])
@@ -228,7 +286,8 @@ class Indexer:
                 if event.is_directory:
                     return
                 if Path(event.src_path).suffix.lower() in IMAGE_EXTS:
-                    idx._watch_queue.put(event.src_path)
+                    idx.db.enqueue_scan_job(event.src_path)
+                    idx._watch_wakeup.set()
 
         self._observer = Observer()
         n = 0
@@ -243,25 +302,27 @@ class Indexer:
             log.info("增量监听已启动: %d 个目录", n)
 
     def _consume_watch(self):
-        """防抖:攒 3 秒内的变更一起处理。"""
+        """消费持久化扫描任务；全量索引期间事件仍留在数据库，不会丢失。"""
         paths = get_paths()
         while True:
-            batch = {self._watch_queue.get()}
-            deadline = time.time() + 3
-            while time.time() < deadline:
-                try:
-                    batch.add(self._watch_queue.get(timeout=0.5))
-                except queue.Empty:
-                    pass
+            self._watch_wakeup.wait(timeout=3)
+            self._watch_wakeup.clear()
             if self._running.is_set():
-                continue  # 全量索引中,交给它处理
-            for sp in batch:
+                continue
+            jobs = self.db.claim_scan_jobs()
+            if not jobs:
+                continue
+            for job in jobs:
+                sp = job["photo_path"]
                 p = Path(sp)
                 if not p.exists():
+                    self.db.mark_missing(sp)
+                    self.db.finish_job(job["id"], "succeeded")
                     continue
                 try:
                     st = p.stat()
                     if self.db.photo_unchanged(str(p), st.st_size, st.st_mtime):
+                        self.db.finish_job(job["id"], "succeeded")
                         continue  # 编辑器重复触发的 modified 事件,内容没变,不重做
                     meta = scanner.scan_one(
                         p, paths["thumbs"], self.cfg.thumb_size, self.cfg.thumb_quality
@@ -269,7 +330,13 @@ class Indexer:
                     if meta:
                         pid = self.db.upsert_photo(meta)
                         self.db.mark_ready(pid)
+                        row = self.db.query(
+                            "SELECT id, path, sha1 FROM photos WHERE id=?", (pid,)
+                        )[0]
+                        self._enqueue_processors(row, priority=10)
+                    self.db.finish_job(job["id"], "succeeded")
                 except Exception as e:
+                    self.db.finish_job(job["id"], "failed", str(e))
                     log.warning("增量扫描失败 %s: %s", sp, e)
             # 只补齐新照片的向量/OCR/人脸
             try:
@@ -277,6 +344,6 @@ class Indexer:
                 self._stage_ocr()
                 self._stage_faces()
                 self.vindex.refresh()
-                log.info("增量索引完成: +%d", len(batch))
+                log.info("增量索引完成: +%d", len(jobs))
             except Exception as e:
                 log.warning("增量索引失败: %s", e)
