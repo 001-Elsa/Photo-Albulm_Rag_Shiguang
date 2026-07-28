@@ -3,8 +3,8 @@ FROM python:3.11-slim
 WORKDIR /app
 
 # 先装依赖,充分利用镜像层缓存
-COPY requirements.txt .
-RUN pip install --no-cache-dir fastapi uvicorn pillow numpy watchdog
+COPY requirements-core.txt .
+RUN pip install --no-cache-dir -r requirements-core.txt
 
 # 语义模型按需启用(镜像体积换能力):
 # RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu && \

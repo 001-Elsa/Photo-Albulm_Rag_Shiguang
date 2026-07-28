@@ -1,17 +1,2 @@
-# 核心依赖(必装)
-fastapi>=0.110
-uvicorn>=0.29
-pillow>=10.0
-numpy>=1.24
-watchdog>=4.0
-
-# ---- 语义检索模型(二选一,推荐先装这组) ----
-# torch>=2.1
-# transformers>=4.38
-# (或:用 scripts/export_onnx.py 导出 ONNX 后,只需 onnxruntime + transformers 的分词器)
-
-# ---- 可选功能 ----
-# rapidocr-onnxruntime>=1.3   # OCR:截图文字搜索
-# insightface>=0.7            # 人脸聚类("和某人的合影")
-# onnxruntime>=1.17           # ONNX 推理/量化
-# pillow-heif>=0.15           # iPhone HEIC 格式支持
+# 向后兼容入口。新部署请按功能选择 requirements-*.txt。
+-r requirements-core.txt
