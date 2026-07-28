@@ -60,12 +60,13 @@ class SearchEngine:
             embedder._inference_gate = threading.BoundedSemaphore(
                 max(1, cfg.inference_concurrency)
             )
-        self.vindex = create_vector_store(db, cfg)
+        self.vindex = create_vector_store(db, cfg, dim=embedder.dim)
 
     # ---------- 结构化过滤 ----------
     def _allowed_ids(self, pq: ParsedQuery) -> set[int] | None:
         """按 EXIF/人物/截图条件筛出候选 photo_id 集;无条件返回 None(不过滤)。"""
-        clauses, args = [], []
+        clauses: list[str] = []
+        args: list[object] = []
         if pq.year_from:
             clauses.append("year >= ?")
             args.append(pq.year_from)
@@ -86,7 +87,7 @@ class SearchEngine:
             if has:
                 clauses.append("place LIKE ?")
                 args.append(f"%{pq.place}%")
-        person_ids = None
+        person_ids: list[int] | None = None
         if pq.person:
             rows = self.db.query(
                 "SELECT id FROM persons WHERE name LIKE ?", (f"%{pq.person}%",)
@@ -157,7 +158,7 @@ class SearchEngine:
                 [semantic_weight, ocr_weight],
                 self.cfg.rrf_k,
             )
-            ordered = sorted(fused, key=fused.get, reverse=True)[:limit]
+            ordered = sorted(fused, key=lambda pid: fused[pid], reverse=True)[:limit]
         elif allowed is not None:
             # 纯结构化查询("2024年的照片"):按时间倒序
             marks = ",".join("?" * len(allowed))

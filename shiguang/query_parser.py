@@ -105,9 +105,9 @@ def parse_rules(query: str, today: date | None = None) -> ParsedQuery:
     m = _RE_MONTH.search(q)
     if m and not p.months:
         raw = m.group(1)
-        mth = int(raw) if raw.isdigit() else CN_NUM.get(raw)
-        if mth and 1 <= mth <= 12:
-            p.months = [mth]
+        parsed_month: int | None = int(raw) if raw.isdigit() else CN_NUM.get(raw)
+        if parsed_month and 1 <= parsed_month <= 12:
+            p.months = [parsed_month]
             q = q.replace(m.group(0), " ")
 
     # 季节 → 月份集合(季节词保留在语义里,画面本身有季节特征)

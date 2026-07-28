@@ -51,10 +51,11 @@ def test_token_tampered():
 
 
 def test_token_bad_role_rejected():
+    import hashlib
+    import hmac as _hmac
     import json as _json
 
     body = auth._b64e(_json.dumps({"u": "x", "r": "root", "exp": time.time() + 99}).encode())
-    import hashlib, hmac as _hmac
 
     sig = auth._b64e(_hmac.new(SECRET, body.encode(), hashlib.sha256).digest())
     assert auth.verify_token(SECRET, f"{body}.{sig}") is None

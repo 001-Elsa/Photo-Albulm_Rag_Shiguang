@@ -1,7 +1,7 @@
-"""索引管线编排:扫描 → 向量化 → OCR → 人脸,支持断点续建、增量监听、进度回报。
+"""索引管线编排:扫描 → 向量化 → OCR → 人脸。
 
-断点续建原理:每张照片在 photos 表上有 embedded/ocr_done/faces_done 三个阶段标记,
-管线每次启动只处理未完成的部分——中途杀进程再启动,自动从断点继续。
+实际调度以持久化 index_jobs 状态机为准；photos 上的旧布尔字段只保留为兼容统计，
+不参与任务领取。任务支持幂等结果写入、指数退避、心跳回收和人工取消/重试。
 """
 from __future__ import annotations
 
@@ -61,7 +61,9 @@ class Indexer:
         self.vindex = vindex
         self.progress = Progress()
         self._running = threading.Event()
+        self._start_lock = threading.Lock()
         self._watch_wakeup = threading.Event()
+        self._stop = threading.Event()
         self._observer = None
 
     @property
@@ -72,15 +74,17 @@ class Indexer:
         pid, path, content_hash = row["id"], row["path"], row["sha1"]
         self.db.enqueue_job(
             pid, path, "embedding", self.cfg.embed_model, self._embed_version,
-            content_hash, priority=priority,
+            content_hash, priority=priority, max_retries=self.cfg.index_max_retries,
         )
         self.db.enqueue_job(
             pid, path, "ocr", "rapidocr", self.cfg.ocr_version, content_hash,
             enabled=bool(self.cfg.enable_ocr and self.ocr.available), priority=priority,
+            max_retries=self.cfg.index_max_retries,
         )
         self.db.enqueue_job(
             pid, path, "face", self.cfg.face_model, self.cfg.face_version, content_hash,
             enabled=bool(self.cfg.enable_faces and self.faces.available), priority=priority,
+            max_retries=self.cfg.index_max_retries,
         )
 
     def _ensure_jobs(self):
@@ -88,15 +92,34 @@ class Indexer:
             self._enqueue_processors(row)
 
     # ---------- 全量/断点 索引 ----------
-    def run_full(self):
-        """完整管线(在后台线程调用)。可重入:已完成的照片自动跳过。"""
-        if self._running.is_set():
-            log.info("索引已在运行,忽略重复请求")
-            return
-        self._running.set()
+    def start_async(self) -> bool:
+        """启动本地后台 worker；返回 False 表示已有索引任务在运行。"""
+        with self._start_lock:
+            if self._running.is_set():
+                return False
+            self._running.set()
+        threading.Thread(target=self._run_full_body, daemon=True, name="index-worker").start()
+        return True
+
+    def run_full(self) -> bool:
+        """同步执行完整管线。并发调用只允许一个执行者。"""
+        with self._start_lock:
+            if self._running.is_set():
+                log.info("索引已在运行,忽略重复请求")
+                return False
+            self._running.set()
+        self._run_full_body()
+        return True
+
+    def _run_full_body(self):
         self.progress.reset()
         self.progress.update(started_at=time.time())
         try:
+            recovered = self.db.recover_stale_jobs(
+                self.cfg.index_heartbeat_timeout_seconds
+            )
+            if recovered:
+                log.warning("已回收 %d 个心跳超时任务", recovered)
             self._stage_scan()
             self._ensure_jobs()
             self._stage_embed()
@@ -110,6 +133,20 @@ class Indexer:
             self.progress.update(stage="error", current=str(e), finished=True)
         finally:
             self._running.clear()
+
+    def _fail(self, job_id: int, error: Exception | str):
+        return self.db.fail_job(
+            job_id, str(error), base_delay=self.cfg.index_retry_base_seconds
+        )
+
+    def _wait_for_retry(self, task_type: str, processor_version: str) -> bool:
+        """有待退避任务时等待到下一次领取；每 5 秒可响应应用关闭。"""
+        delay = self.db.next_retry_delay(task_type, processor_version)
+        if delay is None or self._stop.is_set():
+            return False
+        self.progress.update(current=f"{task_type} 重试等待 {delay:.1f}s")
+        self._stop.wait(timeout=min(max(delay, 0.01), 5.0))
+        return not self._stop.is_set()
 
     def _stage_scan(self):
         paths = get_paths()
@@ -151,7 +188,7 @@ class Indexer:
     def _stage_embed(self):
         total = len(self.db.query(
             """SELECT id FROM index_jobs WHERE task_type='embedding'
-               AND processor_version=? AND status IN ('pending','failed')""",
+               AND processor_version=? AND status IN ('pending','retrying')""",
             (self._embed_version,),
         ))
         self.progress.update(stage="embed", total=total, done=0)
@@ -162,6 +199,8 @@ class Indexer:
                 self.cfg.index_max_retries,
             )
             if not rows:
+                if self._wait_for_retry("embedding", self._embed_version):
+                    continue
                 break
             imgs, ok_rows = [], []
             for r in rows:
@@ -171,7 +210,7 @@ class Indexer:
                     imgs.append(im)
                     ok_rows.append(r)
                 except Exception as e:
-                    self.db.finish_job(r["job_id"], "failed", str(e))
+                    self._fail(r["job_id"], e)
                     self.progress.update(errors=self.progress.errors + 1)
             if imgs:
                 gate = getattr(self.embedder, "_inference_gate", None)
@@ -179,17 +218,35 @@ class Indexer:
                     gate = self.embedder._inference_gate = threading.BoundedSemaphore(
                         max(1, self.cfg.inference_concurrency)
                     )
-                with gate:
-                    vecs = self.embedder.encode_images(imgs)
-                for r, v in zip(ok_rows, vecs):
-                    self.db.save_embedding(
-                        r["id"], v.astype("float32").tobytes(), v.shape[0],
-                        model_name=self.cfg.embed_model,
-                        model_version=self._embed_version,
-                        content_hash=r["content_hash"], job_id=r["job_id"],
+                for r in ok_rows:
+                    self.db.heartbeat_job(r["job_id"])
+                try:
+                    with gate:
+                        vecs = self.embedder.encode_images(imgs)
+                    if len(vecs) != len(ok_rows):
+                        raise RuntimeError(
+                            f"模型返回 {len(vecs)} 个向量，期望 {len(ok_rows)} 个"
+                        )
+                    for r, v in zip(ok_rows, vecs):
+                        try:
+                            self.db.save_embedding(
+                                r["id"], v.astype("float32").tobytes(), v.shape[0],
+                                model_name=self.cfg.embed_model,
+                                model_version=self._embed_version,
+                                content_hash=r["content_hash"], job_id=r["job_id"],
+                            )
+                        except Exception as e:
+                            self._fail(r["job_id"], e)
+                            self.progress.update(errors=self.progress.errors + 1)
+                except Exception as e:
+                    for r in ok_rows:
+                        self._fail(r["job_id"], e)
+                    self.progress.update(
+                        errors=self.progress.errors + len(ok_rows)
                     )
-                for im in imgs:
-                    im.close()
+                finally:
+                    for im in imgs:
+                        im.close()
             done += len(rows)
             self.progress.update(done=done, current=rows[-1]["path"])
 
@@ -198,7 +255,7 @@ class Indexer:
             return
         total = len(self.db.query(
             """SELECT id FROM index_jobs WHERE task_type='ocr'
-               AND processor_version=? AND status IN ('pending','failed')""",
+               AND processor_version=? AND status IN ('pending','retrying')""",
             (self.cfg.ocr_version,),
         ))
         self.progress.update(stage="ocr", total=total, done=0)
@@ -208,9 +265,12 @@ class Indexer:
                 "ocr", self.cfg.ocr_version, 50, self.cfg.index_max_retries,
             )
             if not rows:
+                if self._wait_for_retry("ocr", self.cfg.ocr_version):
+                    continue
                 break
             for r in rows:
                 try:
+                    self.db.heartbeat_job(r["job_id"])
                     with Image.open(r["path"]) as im:
                         # 非截图的大照片缩小再 OCR,提速 5~10 倍
                         if not r["is_screenshot"]:
@@ -222,7 +282,7 @@ class Indexer:
                         content_hash=r["content_hash"], job_id=r["job_id"],
                     )
                 except Exception as e:
-                    self.db.finish_job(r["job_id"], "failed", str(e))
+                    self._fail(r["job_id"], e)
                     self.progress.update(errors=self.progress.errors + 1)
                 done += 1
                 self.progress.update(done=done, current=r["path"])
@@ -234,7 +294,7 @@ class Indexer:
 
         total = len(self.db.query(
             """SELECT id FROM index_jobs WHERE task_type='face'
-               AND processor_version=? AND status IN ('pending','failed')""",
+               AND processor_version=? AND status IN ('pending','retrying')""",
             (self.cfg.face_version,),
         ))
         self.progress.update(stage="faces", total=total, done=0)
@@ -245,16 +305,19 @@ class Indexer:
                 "face", self.cfg.face_version, 50, self.cfg.index_max_retries,
             )
             if not rows:
+                if self._wait_for_retry("face", self.cfg.face_version):
+                    continue
                 break
             for r in rows:
                 try:
+                    self.db.heartbeat_job(r["job_id"])
                     with Image.open(r["path"]) as im:
                         found = self.faces.detect(im)
                     self.db.save_faces(r["id"], found, job_id=r["job_id"])
                     if found:
                         new_faces = True
                 except Exception as e:
-                    self.db.finish_job(r["job_id"], "failed", str(e))
+                    self._fail(r["job_id"], e)
                     self.progress.update(errors=self.progress.errors + 1)
                 done += 1
                 self.progress.update(done=done, current=r["path"])
@@ -266,6 +329,8 @@ class Indexer:
     # ---------- 增量监听 ----------
     def start_watcher(self):
         """watchdog 监听相册目录,新增/修改的图片进队列,由后台线程消费。"""
+        self.stop_watcher()
+        self._stop.clear()
         try:
             from watchdog.events import FileSystemEventHandler
             from watchdog.observers import Observer
@@ -298,13 +363,15 @@ class Indexer:
         if n:
             self._observer.daemon = True
             self._observer.start()
-            threading.Thread(target=self._consume_watch, daemon=True).start()
+            threading.Thread(
+                target=self._consume_watch, daemon=True, name="watch-worker"
+            ).start()
             log.info("增量监听已启动: %d 个目录", n)
 
     def _consume_watch(self):
         """消费持久化扫描任务；全量索引期间事件仍留在数据库，不会丢失。"""
         paths = get_paths()
-        while True:
+        while not self._stop.is_set():
             self._watch_wakeup.wait(timeout=3)
             self._watch_wakeup.clear()
             if self._running.is_set():
@@ -336,7 +403,7 @@ class Indexer:
                         self._enqueue_processors(row, priority=10)
                     self.db.finish_job(job["id"], "succeeded")
                 except Exception as e:
-                    self.db.finish_job(job["id"], "failed", str(e))
+                    self._fail(job["id"], e)
                     log.warning("增量扫描失败 %s: %s", sp, e)
             # 只补齐新照片的向量/OCR/人脸
             try:
@@ -347,3 +414,14 @@ class Indexer:
                 log.info("增量索引完成: +%d", len(jobs))
             except Exception as e:
                 log.warning("增量索引失败: %s", e)
+
+    def stop_watcher(self):
+        self._stop.set()
+        self._watch_wakeup.set()
+        if self._observer is not None:
+            self._observer.stop()
+            self._observer.join(timeout=5)
+            self._observer = None
+
+    def close(self):
+        self.stop_watcher()

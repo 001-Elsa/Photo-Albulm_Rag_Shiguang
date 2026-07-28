@@ -141,10 +141,63 @@ CREATE INDEX IF NOT EXISTS idx_index_jobs_claim
 CREATE INDEX IF NOT EXISTS idx_index_jobs_photo ON index_jobs(photo_id);
 """
 
+# 004:任务状态机补齐重试退避、心跳、取消和 worker 归属。
+# SQLite 不能直接修改 CHECK/UNIQUE 约束，因此以新表搬迁。
+_M004_JOB_LIFECYCLE = """
+CREATE TABLE index_jobs_v4 (
+    id                INTEGER PRIMARY KEY,
+    photo_id          INTEGER REFERENCES photos(id) ON DELETE CASCADE,
+    photo_path        TEXT NOT NULL,
+    task_type         TEXT NOT NULL
+                      CHECK(task_type IN ('scan', 'embedding', 'ocr', 'face')),
+    status            TEXT NOT NULL DEFAULT 'pending'
+                      CHECK(status IN (
+                          'pending', 'running', 'retrying', 'succeeded',
+                          'failed', 'cancelled', 'skipped'
+                      )),
+    retry_count       INTEGER NOT NULL DEFAULT 0,
+    max_retries       INTEGER NOT NULL DEFAULT 3,
+    priority          INTEGER NOT NULL DEFAULT 0,
+    last_error        TEXT,
+    processor_name    TEXT NOT NULL,
+    processor_version TEXT NOT NULL,
+    content_hash      TEXT,
+    worker_id         TEXT,
+    created_at        REAL NOT NULL,
+    updated_at        REAL NOT NULL,
+    next_attempt_at   REAL,
+    started_at        REAL,
+    heartbeat_at      REAL,
+    finished_at       REAL,
+    UNIQUE(photo_path, task_type, processor_name, processor_version)
+);
+
+INSERT INTO index_jobs_v4 (
+    id, photo_id, photo_path, task_type, status, retry_count, max_retries,
+    priority, last_error, processor_name, processor_version, content_hash,
+    created_at, updated_at, next_attempt_at, started_at, heartbeat_at, finished_at
+)
+SELECT
+    id, photo_id, photo_path, task_type, status, retry_count, 3,
+    priority, last_error, processor_name, processor_version, content_hash,
+    created_at, updated_at,
+    CASE WHEN status IN ('pending', 'failed') THEN updated_at ELSE NULL END,
+    started_at, CASE WHEN status='running' THEN updated_at ELSE NULL END, finished_at
+FROM index_jobs;
+
+DROP TABLE index_jobs;
+ALTER TABLE index_jobs_v4 RENAME TO index_jobs;
+CREATE INDEX idx_index_jobs_claim
+    ON index_jobs(task_type, status, next_attempt_at, priority DESC, created_at);
+CREATE INDEX idx_index_jobs_photo ON index_jobs(photo_id);
+CREATE INDEX idx_index_jobs_heartbeat ON index_jobs(status, heartbeat_at);
+"""
+
 MIGRATIONS: list[tuple[int, str]] = [
     (1, _M001_BASE),
     (2, _M002_AUTH),
     (3, _M003_RELIABLE_INDEXING),
+    (4, _M004_JOB_LIFECYCLE),
 ]
 
 LATEST = max(v for v, _ in MIGRATIONS)

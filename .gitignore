@@ -6,6 +6,8 @@ htmlcov/
 
 .env
 *.log
+deploy/secrets/*.txt
+!deploy/secrets/*.example
 
 data/*
 !data/.gitkeep

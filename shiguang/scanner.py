@@ -6,9 +6,9 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import os
 from datetime import datetime
 from pathlib import Path
+from typing import TypedDict
 
 from PIL import Image, ExifTags
 
@@ -27,6 +27,13 @@ except Exception:
 # EXIF tag id 反查表
 _TAGS = {v: k for k, v in ExifTags.TAGS.items()}
 _GPS_TAGS = {v: k for k, v in ExifTags.GPSTAGS.items()}
+
+
+class ExifData(TypedDict):
+    taken_at: str | None
+    lat: float | None
+    lon: float | None
+    camera: str | None
 
 
 def iter_images(dirs: list[str]):
@@ -78,9 +85,11 @@ def _gps_to_deg(val, ref) -> float | None:
         return None
 
 
-def parse_exif(img: Image.Image) -> dict:
+def parse_exif(img: Image.Image) -> ExifData:
     """取拍摄时间 / GPS / 相机型号。全部容错,取不到就是 None。"""
-    out = {"taken_at": None, "lat": None, "lon": None, "camera": None}
+    out: ExifData = {
+        "taken_at": None, "lat": None, "lon": None, "camera": None
+    }
     try:
         exif = img.getexif()
         if not exif:
@@ -89,10 +98,10 @@ def parse_exif(img: Image.Image) -> dict:
         dt = None
         try:
             ifd = exif.get_ifd(0x8769)  # ExifIFD
-            dt = ifd.get(_TAGS.get("DateTimeOriginal"))
+            dt = ifd.get(_TAGS.get("DateTimeOriginal") or 0)
         except Exception:
             pass
-        dt = dt or exif.get(_TAGS.get("DateTime"))
+        dt = dt or exif.get(_TAGS.get("DateTime") or 0)
         if dt:
             try:
                 out["taken_at"] = datetime.strptime(
@@ -100,8 +109,8 @@ def parse_exif(img: Image.Image) -> dict:
                 ).isoformat()
             except ValueError:
                 pass
-        make = exif.get(_TAGS.get("Make"), "")
-        model = exif.get(_TAGS.get("Model"), "")
+        make = exif.get(_TAGS.get("Make") or 0, "")
+        model = exif.get(_TAGS.get("Model") or 0, "")
         cam = f"{make} {model}".strip()
         out["camera"] = cam or None
         # GPS
@@ -109,12 +118,12 @@ def parse_exif(img: Image.Image) -> dict:
             gps = exif.get_ifd(0x8825)  # GPSIFD
             if gps:
                 lat = _gps_to_deg(
-                    gps.get(_GPS_TAGS.get("GPSLatitude")),
-                    gps.get(_GPS_TAGS.get("GPSLatitudeRef")),
+                    gps.get(_GPS_TAGS.get("GPSLatitude") or 0),
+                    gps.get(_GPS_TAGS.get("GPSLatitudeRef") or 0),
                 )
                 lon = _gps_to_deg(
-                    gps.get(_GPS_TAGS.get("GPSLongitude")),
-                    gps.get(_GPS_TAGS.get("GPSLongitudeRef")),
+                    gps.get(_GPS_TAGS.get("GPSLongitude") or 0),
+                    gps.get(_GPS_TAGS.get("GPSLongitudeRef") or 0),
                 )
                 out["lat"], out["lon"] = lat, lon
         except Exception:
@@ -128,7 +137,9 @@ def phash(img: Image.Image, hash_size: int = 8) -> str:
     """DCT 感知哈希(纯 numpy 实现),返回 16 位十六进制。"""
     import numpy as np
 
-    g = img.convert("L").resize((hash_size * 4, hash_size * 4), Image.LANCZOS)
+    g = img.convert("L").resize(
+        (hash_size * 4, hash_size * 4), Image.Resampling.LANCZOS
+    )
     a = np.asarray(g, dtype=np.float64)
     # 二维 DCT-II(用 FFT 实现,避免 scipy 依赖)
     def dct1d(x):
@@ -171,7 +182,7 @@ def is_screenshot(path: Path, img: Image.Image, has_exif_camera: bool) -> bool:
 def make_thumb(img: Image.Image, out_path: Path, size: int, quality: int):
     out_path.parent.mkdir(parents=True, exist_ok=True)
     t = img.copy()
-    t.thumbnail((size, size), Image.LANCZOS)
+    t.thumbnail((size, size), Image.Resampling.LANCZOS)
     if t.mode not in ("RGB", "L"):
         t = t.convert("RGB")
     t.save(out_path, "JPEG", quality=quality)

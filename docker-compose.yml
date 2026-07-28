@@ -1,33 +1,241 @@
-# 拾光企业部署
-#   基础:      docker compose up -d
-#   带 pgvector: docker compose --profile pg up -d
-#              (并设 SHIGUANG_VECTOR_BACKEND=pgvector)
+name: shiguang
+
+x-enterprise-env: &enterprise-env
+  SHIGUANG_DEPLOYMENT_MODE: enterprise
+  SHIGUANG_HOST: 0.0.0.0
+  SHIGUANG_JSON_LOGS: "true"
+  SHIGUANG_PG_HOST: postgres
+  SHIGUANG_PG_PORT: "5432"
+  SHIGUANG_PG_DATABASE: shiguang
+  SHIGUANG_PG_USER: shiguang_app
+  SHIGUANG_PG_PASSWORD_FILE: /run/secrets/postgres_app_password
+  SHIGUANG_REDIS_URL: redis://redis:6379/0
+  SHIGUANG_CELERY_BROKER_URL: redis://redis:6379/1
+  SHIGUANG_CELERY_RESULT_BACKEND: redis://redis:6379/2
+  SHIGUANG_MINIO_ENDPOINT: minio:9000
+  SHIGUANG_MINIO_ACCESS_KEY: ${SHIGUANG_MINIO_ACCESS_KEY:-shiguang}
+  SHIGUANG_MINIO_SECRET_KEY_FILE: /run/secrets/minio_secret_key
+  SHIGUANG_MINIO_BUCKET: shiguang-assets
+  SHIGUANG_SESSION_SECRET_FILE: /run/secrets/session_secret
+  SHIGUANG_BOOTSTRAP_ADMIN_PASSWORD_FILE: /run/secrets/bootstrap_admin_password
+  SHIGUANG_BOOTSTRAP_ADMIN_USERNAME: ${SHIGUANG_BOOTSTRAP_ADMIN_USERNAME:-admin}
+  SHIGUANG_BOOTSTRAP_ORGANIZATION_NAME: ${SHIGUANG_BOOTSTRAP_ORGANIZATION_NAME:-Shiguang}
+  SHIGUANG_BOOTSTRAP_ORGANIZATION_SLUG: ${SHIGUANG_BOOTSTRAP_ORGANIZATION_SLUG:-shiguang}
+  SHIGUANG_METRICS_TOKEN_FILE: /run/secrets/metrics_token
+  SHIGUANG_COOKIE_SECURE: ${SHIGUANG_COOKIE_SECURE:-false}
+  SHIGUANG_EMBED_BACKEND: ${SHIGUANG_EMBED_BACKEND:-demo}
+  SHIGUANG_EMBEDDING_DIMENSION: ${SHIGUANG_EMBEDDING_DIMENSION:-512}
+  SHIGUANG_ENABLE_OCR: ${SHIGUANG_ENABLE_OCR:-false}
+  SHIGUANG_ENABLE_FACES: ${SHIGUANG_ENABLE_FACES:-false}
+  SHIGUANG_OTLP_ENDPOINT: http://otel-collector:4318/v1/traces
+
+x-runtime-dependencies: &runtime-dependencies
+  migrate:
+    condition: service_completed_successfully
+  redis:
+    condition: service_healthy
+  minio:
+    condition: service_healthy
+
+x-runtime-secrets: &runtime-secrets
+  - postgres_app_password
+  - minio_secret_key
+  - session_secret
+  - bootstrap_admin_password
+  - metrics_token
+
 services:
-  shiguang:
-    build: .
+  nginx:
+    image: nginx:1.27-alpine
     ports:
-      - "8626:8626"
+      - "8626:80"
     volumes:
-      - shiguang-data:/data
-      - /path/to/photos:/photos:ro   # ← 改成真实图库目录(只读挂载)
-    environment:
-      SHIGUANG_LIBRARY_DIRS: /photos
-      SHIGUANG_JSON_LOGS: "true"
-      # SHIGUANG_VECTOR_BACKEND: pgvector
-      # SHIGUANG_PG_DSN: postgresql://shiguang:shiguang@pg:5432/shiguang
+      - ./deploy/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      api:
+        condition: service_healthy
     restart: unless-stopped
 
-  pg:
-    image: pgvector/pgvector:pg16
-    profiles: ["pg"]
-    environment:
-      POSTGRES_USER: shiguang
-      POSTGRES_PASSWORD: shiguang
-      POSTGRES_DB: shiguang
-    volumes:
-      - pg-data:/var/lib/postgresql/data
+  api:
+    build: .
+    command: ["python", "run.py"]
+    expose:
+      - "8626"
+    environment: *enterprise-env
+    secrets: *runtime-secrets
+    depends_on: *runtime-dependencies
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8626/readyz')"
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
     restart: unless-stopped
+
+  migrate:
+    build: .
+    command: ["python", "-m", "shiguang.infrastructure.database.migrate"]
+    environment:
+      <<: *enterprise-env
+      SHIGUANG_PG_ADMIN_USER: shiguang_admin
+      SHIGUANG_PG_ADMIN_PASSWORD_FILE: /run/secrets/postgres_admin_password
+    secrets:
+      - postgres_app_password
+      - postgres_admin_password
+      - minio_secret_key
+      - session_secret
+      - bootstrap_admin_password
+      - metrics_token
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  worker:
+    build: .
+    command:
+      - celery
+      - -A
+      - shiguang.workers.celery_app.celery_app
+      - worker
+      - --loglevel=INFO
+      - --concurrency=${SHIGUANG_WORKER_CONCURRENCY:-2}
+      - --queues=celery
+    environment: *enterprise-env
+    secrets: *runtime-secrets
+    depends_on: *runtime-dependencies
+    restart: unless-stopped
+
+  beat:
+    build: .
+    command:
+      - celery
+      - -A
+      - shiguang.workers.celery_app.celery_app
+      - beat
+      - --loglevel=INFO
+      - --schedule=/tmp/celerybeat-schedule
+    environment: *enterprise-env
+    secrets: *runtime-secrets
+    depends_on: *runtime-dependencies
+    restart: unless-stopped
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: shiguang_admin
+      POSTGRES_DB: shiguang
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_admin_password
+    secrets:
+      - postgres_admin_password
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:${SHIGUANG_PG_EXPOSE_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U shiguang_admin -d shiguang"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    ports:
+      - "127.0.0.1:${SHIGUANG_REDIS_EXPOSE_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${SHIGUANG_MINIO_ACCESS_KEY:-shiguang}
+      MINIO_ROOT_PASSWORD_FILE: /run/secrets/minio_secret_key
+    secrets:
+      - minio_secret_key
+    volumes:
+      - minio-data:/data
+    ports:
+      - "127.0.0.1:${SHIGUANG_MINIO_API_PORT:-9000}:9000"
+      - "9001:9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v3.4.1
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+    volumes:
+      - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deploy/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus-data:/prometheus
+    secrets:
+      - metrics_token
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:12.0.2
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD__FILE: /run/secrets/grafana_admin_password
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    secrets:
+      - grafana_admin_password
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.128.0
+    command: ["--config=/etc/otelcol/config.yml"]
+    volumes:
+      - ./deploy/otel-collector.yml:/etc/otelcol/config.yml:ro
+    restart: unless-stopped
+
+secrets:
+  postgres_admin_password:
+    file: ${SHIGUANG_POSTGRES_ADMIN_PASSWORD_FILE:-./deploy/secrets/postgres_admin_password.txt}
+  postgres_app_password:
+    file: ${SHIGUANG_POSTGRES_APP_PASSWORD_FILE:-./deploy/secrets/postgres_app_password.txt}
+  minio_secret_key:
+    file: ${SHIGUANG_MINIO_SECRET_KEY_FILE:-./deploy/secrets/minio_secret_key.txt}
+  session_secret:
+    file: ${SHIGUANG_SESSION_SECRET_FILE:-./deploy/secrets/session_secret.txt}
+  bootstrap_admin_password:
+    file: ${SHIGUANG_BOOTSTRAP_ADMIN_PASSWORD_FILE:-./deploy/secrets/bootstrap_admin_password.txt}
+  metrics_token:
+    file: ${SHIGUANG_METRICS_TOKEN_FILE:-./deploy/secrets/metrics_token.txt}
+  grafana_admin_password:
+    file: ${SHIGUANG_GRAFANA_PASSWORD_FILE:-./deploy/secrets/grafana_admin_password.txt}
 
 volumes:
-  shiguang-data:
-  pg-data:
+  postgres-data:
+  redis-data:
+  minio-data:
+  prometheus-data:
+  grafana-data:

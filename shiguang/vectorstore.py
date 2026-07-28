@@ -89,6 +89,26 @@ class PgVectorStore:
         self.conn = psycopg.connect(dsn, autocommit=True)
         with self.conn.cursor() as cur:
             cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+            cur.execute("SELECT to_regclass('public.photo_vectors')")
+            table_row = cur.fetchone()
+            assert table_row is not None
+            if table_row[0] is not None:
+                cur.execute(
+                    """SELECT format_type(a.atttypid, a.atttypmod)
+                       FROM pg_attribute a
+                       WHERE a.attrelid='photo_vectors'::regclass
+                         AND a.attname='vec'"""
+                )
+                type_row = cur.fetchone()
+                assert type_row is not None
+                stored_type = type_row[0]
+                if stored_type != f"vector({dim})":
+                    # pgvector 是 SQLite 派生缓存；维度变化时可安全重建。
+                    log.warning(
+                        "pgvector 维度由 %s 变为 vector(%d)，重建派生向量表",
+                        stored_type, dim,
+                    )
+                    cur.execute("DROP TABLE photo_vectors")
             cur.execute(
                 f"""CREATE TABLE IF NOT EXISTS photo_vectors (
                         photo_id BIGINT PRIMARY KEY,
@@ -115,11 +135,16 @@ class PgVectorStore:
     def sync_from_sqlite(self):
         """同步新增或内容/模型版本已变化的向量。"""
         rows = self.db.all_embeddings()
-        if not rows:
-            return
         with self.conn.cursor() as cur:
             cur.execute("SELECT photo_id, content_hash, model_version FROM photo_vectors")
             have = {r[0]: (r[1], r[2]) for r in cur.fetchall()}
+            source_ids = {r["photo_id"] for r in rows}
+            removed = set(have) - source_ids
+            if removed:
+                cur.execute(
+                    "DELETE FROM photo_vectors WHERE photo_id = ANY(%s)",
+                    (list(removed),),
+                )
             todo = [
                 r for r in rows
                 if have.get(r["photo_id"]) != (r["content_hash"], r["model_version"])
@@ -141,7 +166,7 @@ class PgVectorStore:
                         r["model_version"], r["content_hash"], r["updated_at"],
                     ),
                 )
-        log.info("pgvector 同步完成: +%d", len(todo))
+        log.info("pgvector 同步完成: +%d/-%d", len(todo), len(removed))
 
     def search(self, qvec: np.ndarray, top_k: int) -> list[tuple[int, float]]:
         with self.conn.cursor() as cur:
@@ -155,15 +180,20 @@ class PgVectorStore:
     def stats(self) -> dict:
         with self.conn.cursor() as cur:
             cur.execute("SELECT COUNT(*) FROM photo_vectors")
-            n = cur.fetchone()[0]
+            count_row = cur.fetchone()
+            assert count_row is not None
+            n = count_row[0]
         return {"backend": self.name, "vectors": n, "dim": self.dim}
 
+    def close(self):
+        self.conn.close()
 
-def create_vector_store(db, cfg):
+
+def create_vector_store(db, cfg, dim: int | None = None):
     """按配置选择后端,pgvector 失败自动回落 local(降级要留日志)。"""
     if getattr(cfg, "vector_backend", "local") == "pgvector":
         try:
-            return PgVectorStore(db, cfg.pg_dsn)
+            return PgVectorStore(db, cfg.pg_dsn, dim=dim or 512)
         except Exception as e:
             log.error("pgvector 不可用,回落 local: %s", e)
     return LocalVectorStore(db)

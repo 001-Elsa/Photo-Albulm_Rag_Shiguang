@@ -57,3 +57,7 @@ def test_pgvector_insert_update_hnsw_and_search():
         )
         assert cur.fetchone() == ("v2", "hash-v2")
 
+    db.mark_missing("/pg-integration.jpg")
+    store.refresh()
+    assert store.stats()["vectors"] == 0
+    store.close()

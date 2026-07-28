@@ -11,7 +11,7 @@
 - EXIF 时间、GPS 城市、截图和已命名人物等结构化过滤。
 - 规则式查询意图识别，按 `scene/document/person/time_location/hybrid` 动态调整 RRF 权重。
 - 返回 `matched_by`、各通道排名和 OCR 片段，便于解释检索结果。
-- SQLite 持久化索引任务，支持状态机、失败重试、重启恢复、模型版本触发重建和幂等覆盖。
+- SQLite 持久化索引任务，支持状态机、指数退避、心跳超时回收、人工取消/重试、模型版本触发重建和幂等覆盖。
 - 默认使用 NumPy 单机向量检索；提供未经大规模压测的 pgvector-HNSW **实验性适配**。
 
 ## 系统架构
@@ -21,7 +21,8 @@
    ↓
 文件扫描 / watchdog 监听
    ↓
-SQLite index_jobs（pending/running/succeeded/failed/skipped）
+SQLite index_jobs
+（pending/running/retrying/succeeded/failed/cancelled/skipped）
    ↓
 EXIF / Thumbnail / pHash
    ├─ Chinese-CLIP 图像向量
@@ -38,7 +39,7 @@ Intent-aware weighted RRF
 FastAPI + 可解释检索结果
 ```
 
-索引结果写入和任务状态更新处于同一短事务。重复执行时，向量和 OCR 使用 upsert，人脸先删除旧记录再写入；任务通过照片内容哈希、处理器版本和唯一约束合并。
+索引结果写入和任务状态更新处于同一短事务。重复执行时，向量和 OCR 使用 upsert，人脸先删除旧记录再写入；任务通过照片内容哈希、处理器名称/版本和唯一约束合并。Worker 写回前还会校验任务仍处于 `running` 且内容哈希未变化，已取消或过期任务不能覆盖新结果。
 
 ## 快速开始
 
@@ -50,7 +51,7 @@ pip install -r requirements-core.txt
 python run.py
 ```
 
-打开 `http://127.0.0.1:8626`，配置相册目录后启动索引。仅安装核心依赖时会使用 `demo` 伪向量，它只能验证程序链路，**不具备真实语义检索能力**。
+打开 `http://127.0.0.1:8626`，配置相册目录后启动索引。个人模式默认关闭认证且只监听 `127.0.0.1`。仅安装核心依赖时会使用 `demo` 伪向量，它只能验证程序链路，**不具备真实语义检索能力**。
 
 完整 CPU AI 依赖：
 
@@ -58,11 +59,38 @@ python run.py
 pip install -r requirements-ai-cpu.txt
 ```
 
-模型首次加载可能需要联网下载；照片数据和模型推理均保留在本地。
+为避免 API 启动阶段意外联网阻塞，默认只读取本地模型缓存。首次下载时显式设置：
+
+```bash
+SHIGUANG_MODEL_DOWNLOAD_ENABLED=true python run.py
+```
+
+照片数据和模型推理均保留在本地。
+
+## 认证与安全配置
+
+多人部署必须显式启用认证，并通过环境变量注入至少 32 字符的会话密钥和初始管理员密码：
+
+```bash
+SHIGUANG_AUTH_ENABLED=true \
+SHIGUANG_REQUIRE_ENV_SECRETS=true \
+SHIGUANG_SESSION_SECRET='replace-with-at-least-32-characters' \
+SHIGUANG_BOOTSTRAP_ADMIN_PASSWORD='replace-now' \
+SHIGUANG_COOKIE_SECURE=true \
+python run.py
+```
+
+- 密码优先使用 Argon2id；旧 PBKDF2 哈希仍可登录。
+- 公开注册默认关闭；管理员通过 `/api/users` 创建用户。
+- 会话默认 1 小时，`HttpOnly + SameSite=Strict`；HTTPS 部署应启用 `Secure`。
+- 用户禁用或角色变化会在下一次请求即时生效，不依赖令牌内的旧角色。
+- `/metrics` 默认关闭；启用 `SHIGUANG_EXPOSE_METRICS=true` 后仍要求管理员身份。
+- 不再默认生成明文管理员密码文件；个人兼容模式可显式开启 `write_bootstrap_password_file`。
 
 ## 健康与降级
 
-`GET /healthz` 会报告真实组件状态：
+- `GET /livez`：只表示 API 进程存活。
+- `GET /readyz`（`/healthz` 兼容别名）：检查数据库、模型与向量后端状态。
 
 ```json
 {
@@ -81,6 +109,8 @@ pip install -r requirements-ai-cpu.txt
 pip install -r requirements-dev.txt
 python -m pytest tests -q
 python -m compileall -q shiguang
+ruff check shiguang eval scripts tests run.py
+mypy shiguang --ignore-missing-imports
 ```
 
 默认 CI 运行无需下载大模型的单元/集成测试、Docker 构建，并在独立 `pgvector/pgvector:pg16` 服务中验证向量插入、更新、HNSW 查询。真实 AI 模型测试仍需在具备相应模型和算力的环境单独执行。
@@ -110,7 +140,9 @@ python eval/run_eval.py --compare fixed dynamic
 - 当前是检索系统，不是包含答案生成环节的完整 RAG。
 - NumPy 后端适合个人单机图库，但尚未声明或证明具体规模上限。
 - pgvector 目前是实验性旁路同步适配，已覆盖基础集成测试，但尚未完成大规模容量与并发验证。
-- Docker 默认构建核心服务，不包含大型 AI 权重。
+- 当前可靠任务执行器仍是单进程本地 Worker；Celery/Redis 的独立 Worker 尚未实现。
+- 当前没有 Organization/Collection 多租户模型，也未接入 MinIO/S3；不能声称具备组织级数据隔离或分布式对象存储。
+- Docker Compose 启动 API 与 pgvector（业务元数据仍在 SQLite），不包含大型 AI 权重。
 - 人脸聚类采用内存中的贪心算法，尚未针对大规模图库验证。
 
 更多说明见 [架构设计](docs/架构设计.md)、[评估指南](docs/评估指南.md)和[安装运行指南](docs/安装运行指南.md)。

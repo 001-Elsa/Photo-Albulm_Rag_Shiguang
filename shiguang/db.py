@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 import time
@@ -25,7 +26,8 @@ class DB:
         from .migrations import migrate
 
         self.schema_version = migrate(self._conn)
-        self.recover_interrupted_jobs()
+        # 只回收过期心跳，避免另一个仍存活的 worker 刚领取任务就被抢回。
+        self.recover_stale_jobs()
 
     # ---------- 基础 ----------
     def execute(self, sql: str, args: tuple = ()):
@@ -84,20 +86,6 @@ class DB:
         return row[0]["id"]
 
     # ---------- persistent index jobs ----------
-    def recover_interrupted_jobs(self):
-        """进程退出时遗留的 running 任务回到 pending，供下次启动续跑。"""
-        with self._lock:
-            try:
-                self._conn.execute(
-                    """UPDATE index_jobs SET status='pending', started_at=NULL,
-                              updated_at=?, last_error=COALESCE(last_error, 'worker interrupted')
-                       WHERE status='running'""",
-                    (time.time(),),
-                )
-                self._conn.commit()
-            except sqlite3.OperationalError:
-                pass
-
     def enqueue_job(
         self,
         photo_id: int | None,
@@ -109,6 +97,7 @@ class DB:
         *,
         enabled: bool = True,
         priority: int = 0,
+        max_retries: int = 3,
     ) -> int:
         """创建或合并任务；内容或处理器变化会重新进入 pending。"""
         now = time.time()
@@ -118,17 +107,19 @@ class DB:
                 """INSERT INTO index_jobs
                        (photo_id, photo_path, task_type, status, retry_count, priority,
                         processor_name, processor_version, content_hash, created_at, updated_at,
-                        finished_at)
-                   VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)
-                   ON CONFLICT(photo_path, task_type, processor_version) DO UPDATE SET
+                        next_attempt_at, max_retries, finished_at)
+                   VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(photo_path, task_type, processor_name, processor_version)
+                   DO UPDATE SET
                        photo_id=excluded.photo_id,
                        priority=MAX(index_jobs.priority, excluded.priority),
-                       processor_name=excluded.processor_name,
                        content_hash=excluded.content_hash,
+                       max_retries=excluded.max_retries,
                        status=CASE
                            WHEN excluded.status='skipped' THEN 'skipped'
                            WHEN index_jobs.content_hash IS NOT excluded.content_hash
-                                OR (index_jobs.status='skipped' AND excluded.status='pending')
+                                OR (index_jobs.status='skipped'
+                                    AND excluded.status='pending')
                            THEN excluded.status ELSE index_jobs.status END,
                        retry_count=CASE
                            WHEN index_jobs.content_hash IS NOT excluded.content_hash THEN 0
@@ -137,17 +128,24 @@ class DB:
                            WHEN index_jobs.content_hash IS NOT excluded.content_hash THEN NULL
                            ELSE index_jobs.last_error END,
                        updated_at=excluded.updated_at,
+                       next_attempt_at=CASE
+                           WHEN index_jobs.content_hash IS NOT excluded.content_hash
+                           THEN excluded.next_attempt_at ELSE index_jobs.next_attempt_at END,
                        finished_at=CASE WHEN excluded.status='skipped' THEN excluded.finished_at
-                                        ELSE index_jobs.finished_at END""",
+                           WHEN index_jobs.content_hash IS NOT excluded.content_hash THEN NULL
+                           ELSE index_jobs.finished_at END""",
                 (
                     photo_id, photo_path, task_type, desired, priority, processor_name,
-                    processor_version, content_hash, now, now, now if desired == "skipped" else None,
+                    processor_version, content_hash, now, now,
+                    now if desired == "pending" else None, max_retries,
+                    now if desired == "skipped" else None,
                 ),
             )
             row = conn.execute(
                 """SELECT id FROM index_jobs
-                   WHERE photo_path=? AND task_type=? AND processor_version=?""",
-                (photo_path, task_type, processor_version),
+                   WHERE photo_path=? AND task_type=? AND processor_name=?
+                     AND processor_version=?""",
+                (photo_path, task_type, processor_name, processor_version),
             ).fetchone()
             return int(row["id"])
 
@@ -162,9 +160,11 @@ class DB:
         with self.transaction() as conn:
             rows = conn.execute(
                 """SELECT id FROM index_jobs
-                   WHERE task_type='scan' AND status IN ('pending', 'failed')
+                   WHERE task_type='scan' AND status IN ('pending', 'retrying')
+                     AND retry_count < max_retries
+                     AND COALESCE(next_attempt_at, 0) <= ?
                    ORDER BY priority DESC, created_at LIMIT ?""",
-                (limit,),
+                (now, limit),
             ).fetchall()
             ids = [int(r["id"]) for r in rows]
             if not ids:
@@ -172,8 +172,9 @@ class DB:
             marks = ",".join("?" * len(ids))
             conn.execute(
                 f"""UPDATE index_jobs SET status='running', started_at=?, updated_at=?,
-                           retry_count=retry_count+1 WHERE id IN ({marks})""",
-                (now, now, *ids),
+                           heartbeat_at=?, worker_id=?, retry_count=retry_count+1,
+                           next_attempt_at=NULL WHERE id IN ({marks})""",
+                (now, now, now, self._worker_id(), *ids),
             )
             return conn.execute(
                 f"SELECT * FROM index_jobs WHERE id IN ({marks}) ORDER BY created_at",
@@ -189,10 +190,11 @@ class DB:
             rows = conn.execute(
                 """SELECT j.id FROM index_jobs j JOIN photos p ON p.id=j.photo_id
                    WHERE j.task_type=? AND j.processor_version=?
-                     AND j.status IN ('pending', 'failed') AND j.retry_count < ?
+                     AND j.status IN ('pending', 'retrying') AND j.retry_count < ?
+                     AND COALESCE(j.next_attempt_at, 0) <= ?
                      AND p.status!='missing'
                    ORDER BY j.priority DESC, j.created_at LIMIT ?""",
-                (task_type, processor_version, max_retries, limit),
+                (task_type, processor_version, max_retries, now, limit),
             ).fetchall()
             ids = [int(r["id"]) for r in rows]
             if not ids:
@@ -200,9 +202,10 @@ class DB:
             marks = ",".join("?" * len(ids))
             conn.execute(
                 f"""UPDATE index_jobs SET status='running', started_at=?, updated_at=?,
-                           retry_count=retry_count+1
+                           heartbeat_at=?, worker_id=?, retry_count=retry_count+1,
+                           next_attempt_at=NULL
                     WHERE id IN ({marks})""",
-                (now, now, *ids),
+                (now, now, now, self._worker_id(), *ids),
             )
             return conn.execute(
                 f"""SELECT j.id AS job_id, j.processor_name, j.processor_version,
@@ -212,14 +215,127 @@ class DB:
                 tuple(ids),
             ).fetchall()
 
-    def finish_job(self, job_id: int, status: str, error: str | None = None):
-        assert status in ("succeeded", "failed", "skipped")
+    @staticmethod
+    def _worker_id() -> str:
+        return f"{os.getpid()}:{threading.get_ident()}"
+
+    def heartbeat_job(self, job_id: int):
         now = time.time()
         self.execute(
-            """UPDATE index_jobs SET status=?, last_error=?, updated_at=?, finished_at=?
+            """UPDATE index_jobs SET heartbeat_at=?, updated_at=?
+               WHERE id=? AND status='running'""",
+            (now, now, job_id),
+        )
+
+    def finish_job(self, job_id: int, status: str, error: str | None = None):
+        assert status in ("succeeded", "failed", "cancelled", "skipped")
+        now = time.time()
+        self.execute(
+            """UPDATE index_jobs SET status=?, last_error=?, updated_at=?, finished_at=?,
+                      heartbeat_at=NULL, worker_id=NULL, next_attempt_at=NULL
                WHERE id=?""",
             (status, (error or "")[:2000] or None, now, now, job_id),
         )
+
+    def fail_job(self, job_id: int, error: str, base_delay: float = 2.0) -> str:
+        """失败后按指数退避进入 retrying；达到上限后进入终态 failed。"""
+        now = time.time()
+        with self.transaction() as conn:
+            row = conn.execute(
+                "SELECT status, retry_count, max_retries FROM index_jobs WHERE id=?",
+                (job_id,),
+            ).fetchone()
+            if not row:
+                raise KeyError(job_id)
+            if row["status"] == "cancelled":
+                return "cancelled"
+            terminal = row["retry_count"] >= row["max_retries"]
+            status = "failed" if terminal else "retrying"
+            delay = 0.0 if terminal else max(0.0, base_delay) * (
+                2 ** max(0, row["retry_count"] - 1)
+            )
+            conn.execute(
+                """UPDATE index_jobs SET status=?, last_error=?, updated_at=?,
+                          next_attempt_at=?, finished_at=?, heartbeat_at=NULL, worker_id=NULL
+                   WHERE id=?""",
+                (
+                    status, error[:2000], now,
+                    None if terminal else now + delay,
+                    now if terminal else None, job_id,
+                ),
+            )
+            return status
+
+    def cancel_job(self, job_id: int) -> bool:
+        now = time.time()
+        cur = self.execute(
+            """UPDATE index_jobs SET status='cancelled', updated_at=?, finished_at=?,
+                      next_attempt_at=NULL, heartbeat_at=NULL, worker_id=NULL
+               WHERE id=? AND status IN ('pending','retrying','running')""",
+            (now, now, job_id),
+        )
+        return cur.rowcount == 1
+
+    def retry_job(self, job_id: int) -> bool:
+        now = time.time()
+        cur = self.execute(
+            """UPDATE index_jobs SET status='pending', retry_count=0, last_error=NULL,
+                      updated_at=?, next_attempt_at=?, started_at=NULL, finished_at=NULL,
+                      heartbeat_at=NULL, worker_id=NULL
+               WHERE id=? AND status IN ('failed','cancelled')""",
+            (now, now, job_id),
+        )
+        return cur.rowcount == 1
+
+    def recover_stale_jobs(self, stale_after: float = 300.0) -> int:
+        """回收心跳超时的 running 任务，不触碰仍活跃的 worker。"""
+        now = time.time()
+        cutoff = now - max(0.0, stale_after)
+        with self.transaction() as conn:
+            cur = conn.execute(
+                """UPDATE index_jobs
+                   SET status=CASE WHEN retry_count >= max_retries
+                                   THEN 'failed' ELSE 'retrying' END,
+                       last_error=COALESCE(last_error, 'worker heartbeat expired'),
+                       updated_at=?, next_attempt_at=CASE
+                           WHEN retry_count >= max_retries THEN NULL ELSE ? END,
+                       finished_at=CASE
+                           WHEN retry_count >= max_retries THEN ? ELSE NULL END,
+                       heartbeat_at=NULL, worker_id=NULL
+                   WHERE status='running'
+                     AND COALESCE(heartbeat_at, started_at, updated_at) <= ?""",
+                (now, now, now, cutoff),
+            )
+            return cur.rowcount
+
+    def recover_interrupted_jobs(self):
+        """兼容旧调用：立即回收所有 running 任务。"""
+        return self.recover_stale_jobs(0)
+
+    def list_jobs(self, limit: int = 100, status: str | None = None) -> list[dict]:
+        limit = max(1, min(limit, 500))
+        if status:
+            rows = self.query(
+                """SELECT * FROM index_jobs WHERE status=?
+                   ORDER BY updated_at DESC LIMIT ?""",
+                (status, limit),
+            )
+        else:
+            rows = self.query(
+                "SELECT * FROM index_jobs ORDER BY updated_at DESC LIMIT ?", (limit,)
+            )
+        return [dict(r) for r in rows]
+
+    def next_retry_delay(self, task_type: str, processor_version: str) -> float | None:
+        row = self.query(
+            """SELECT MIN(next_attempt_at) AS next_at FROM index_jobs
+               WHERE task_type=? AND processor_version=? AND status='retrying'
+                 AND retry_count < max_retries""",
+            (task_type, processor_version),
+        )[0]
+        if row["next_at"] is None:
+            return None
+        return max(0.0, float(row["next_at"]) - time.time())
 
     def job_stats(self) -> dict:
         rows = self.query("SELECT status, COUNT(*) AS n FROM index_jobs GROUP BY status")
@@ -270,6 +386,27 @@ class DB:
         return {k: (r[k] or 0) for k in r.keys()}
 
     # ---------- embeddings ----------
+    @staticmethod
+    def _assert_running_job(
+        conn, job_id: int | None, photo_id: int, content_hash: str | None = None
+    ):
+        if job_id is None:
+            return
+        row = conn.execute(
+            """SELECT j.status, j.photo_id, j.content_hash, p.sha1
+               FROM index_jobs j LEFT JOIN photos p ON p.id=j.photo_id
+               WHERE j.id=?""",
+            (job_id,),
+        ).fetchone()
+        if (
+            not row
+            or row["status"] != "running"
+            or row["photo_id"] != photo_id
+            or row["content_hash"] != row["sha1"]
+            or (content_hash is not None and row["content_hash"] != content_hash)
+        ):
+            raise RuntimeError("任务已取消、被重新调度或内容版本已过期")
+
     def save_embedding(
         self, photo_id: int, vec_bytes: bytes, dim: int, *,
         model_name: str | None = None, model_version: str | None = None,
@@ -277,6 +414,7 @@ class DB:
     ):
         now = time.time()
         with self.transaction() as conn:
+            self._assert_running_job(conn, job_id, photo_id, content_hash)
             conn.execute(
                 """INSERT INTO embeddings
                        (photo_id, dim, vec, model_name, model_version, content_hash, updated_at)
@@ -291,7 +429,8 @@ class DB:
             if job_id is not None:
                 conn.execute(
                     """UPDATE index_jobs SET status='succeeded', last_error=NULL,
-                              updated_at=?, finished_at=? WHERE id=?""",
+                              updated_at=?, finished_at=?, heartbeat_at=NULL,
+                              worker_id=NULL, next_attempt_at=NULL WHERE id=?""",
                     (now, now, job_id),
                 )
 
@@ -311,6 +450,7 @@ class DB:
     ):
         now = time.time()
         with self.transaction() as conn:
+            self._assert_running_job(conn, job_id, photo_id, content_hash)
             conn.execute(
                 """INSERT INTO ocr_text
                        (photo_id, text, raw_text, engine_name, engine_version, content_hash, updated_at)
@@ -328,7 +468,8 @@ class DB:
             if job_id is not None:
                 conn.execute(
                     """UPDATE index_jobs SET status='succeeded', last_error=NULL,
-                              updated_at=?, finished_at=? WHERE id=?""",
+                              updated_at=?, finished_at=?, heartbeat_at=NULL,
+                              worker_id=NULL, next_attempt_at=NULL WHERE id=?""",
                     (now, now, job_id),
                 )
 
@@ -350,6 +491,7 @@ class DB:
         """覆盖旧结果，保证任务重试和重复执行不会产生重复人脸。"""
         now = time.time()
         with self.transaction() as conn:
+            self._assert_running_job(conn, job_id, photo_id)
             conn.execute("DELETE FROM faces WHERE photo_id=?", (photo_id,))
             conn.executemany(
                 "INSERT INTO faces (photo_id, bbox, vec) VALUES (?,?,?)",
@@ -359,7 +501,8 @@ class DB:
             if job_id is not None:
                 conn.execute(
                     """UPDATE index_jobs SET status='succeeded', last_error=NULL,
-                              updated_at=?, finished_at=? WHERE id=?""",
+                              updated_at=?, finished_at=?, heartbeat_at=NULL,
+                              worker_id=NULL, next_attempt_at=NULL WHERE id=?""",
                     (now, now, job_id),
                 )
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+from typing import Any
 
 import numpy as np
 from PIL import Image
@@ -61,7 +62,7 @@ class OnnxClipEmbedder(BaseEmbedder):
 
     name = "onnx"
 
-    def __init__(self, onnx_dir: str, model_name: str):
+    def __init__(self, onnx_dir: str, model_name: str, allow_download: bool = False):
         import onnxruntime as ort  # noqa
         from pathlib import Path
 
@@ -75,7 +76,9 @@ class OnnxClipEmbedder(BaseEmbedder):
         self.txt_sess = ort.InferenceSession(str(txt_path), so, providers=["CPUExecutionProvider"])
         from transformers import ChineseCLIPProcessor  # 仅用它的预处理/分词
 
-        self.proc = ChineseCLIPProcessor.from_pretrained(model_name)
+        self.proc = ChineseCLIPProcessor.from_pretrained(
+            model_name, local_files_only=not allow_download
+        )
         dim = self.img_sess.get_outputs()[0].shape[-1]
         if not isinstance(dim, int):  # 动态导出时 shape 是符号名,实测一次拿真实维度
             dim = int(self.encode_text(["测"]).shape[-1])
@@ -112,14 +115,19 @@ class TransformersClipEmbedder(BaseEmbedder):
 
     name = "transformers"
 
-    def __init__(self, model_name: str):
+    def __init__(self, model_name: str, allow_download: bool = False):
         import torch
         from transformers import ChineseCLIPModel, ChineseCLIPProcessor
 
         self.torch = torch
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.model = ChineseCLIPModel.from_pretrained(model_name).to(self.device).eval()
-        self.proc = ChineseCLIPProcessor.from_pretrained(model_name)
+        local_only = not allow_download
+        self.model = ChineseCLIPModel.from_pretrained(
+            model_name, local_files_only=local_only
+        ).to(self.device).eval()
+        self.proc = ChineseCLIPProcessor.from_pretrained(
+            model_name, local_files_only=local_only
+        )
         self.dim = self.model.config.projection_dim
         log.info("Chinese-CLIP 已加载 (%s, dim=%d)", self.device, self.dim)
 
@@ -140,19 +148,22 @@ class TransformersClipEmbedder(BaseEmbedder):
 
 
 def create_embedder(cfg) -> BaseEmbedder:
-    """按配置与环境选择后端:onnx > transformers > demo。"""
-    order = {
+    """按配置与环境选择后端；默认不在 API 启动阶段联网下载模型。"""
+    orders: dict[str, list[Any]] = {
         "onnx": [OnnxClipEmbedder],
         "transformers": [TransformersClipEmbedder],
         "demo": [DemoEmbedder],
         "auto": [OnnxClipEmbedder, TransformersClipEmbedder, DemoEmbedder],
-    }[cfg.embed_backend]
+    }
+    order = orders[cfg.embed_backend]
     for cls in order:
         try:
             if cls is OnnxClipEmbedder:
-                return cls(cfg.onnx_dir, cfg.embed_model)
+                return cls(
+                    cfg.onnx_dir, cfg.embed_model, cfg.model_download_enabled
+                )
             if cls is TransformersClipEmbedder:
-                return cls(cfg.embed_model)
+                return cls(cfg.embed_model, cfg.model_download_enabled)
             return cls()
         except Exception as e:
             log.warning("%s 后端不可用: %s", cls.__name__, e)

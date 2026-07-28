@@ -122,7 +122,7 @@
       <button type="submit" onclick="doLogin()">登 录</button>
       <div class="switch-text">
         还没有账号？
-        <button type="button" onclick="switchAuthTab('register')">立即注册</button>
+        <button id="login-register-link" type="button" onclick="switchAuthTab('register')">立即注册</button>
       </div>
     </form>
 
@@ -351,6 +351,18 @@ async function checkAuth() {
   } catch { showAuthPage(); return false; }
 }
 
+async function configureAuthUi() {
+  try {
+    const r = await fetch('/api/auth/config');
+    if (!r.ok) return;
+    const cfg = await r.json();
+    const showRegister = !!cfg.public_registration;
+    $('#tab-register-btn').style.display = showRegister ? '' : 'none';
+    $('#login-register-link').style.display = showRegister ? '' : 'none';
+    if (!showRegister) switchAuthTab('login');
+  } catch {}
+}
+
 function showTab(t) {
   currentTab = t;
   document.querySelectorAll('nav button').forEach(b => b.classList.remove('active'));
@@ -514,7 +526,9 @@ async function startIndex() {
 }
 
 /* ====== 启动 ====== */
-checkAuth().then(ok => { if (ok) showTab('search'); });
+configureAuthUi().finally(() => {
+  checkAuth().then(ok => { if (ok) showTab('search'); });
+});
 </script>
 </body>
 </html>

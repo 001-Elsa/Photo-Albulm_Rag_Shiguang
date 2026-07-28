@@ -3,8 +3,8 @@ FROM python:3.11-slim
 WORKDIR /app
 
 # 先装依赖,充分利用镜像层缓存
-COPY requirements-core.txt .
-RUN pip install --no-cache-dir -r requirements-core.txt
+COPY requirements-core.txt requirements-enterprise.txt ./
+RUN pip install --no-cache-dir -r requirements-enterprise.txt
 
 # 语义模型按需启用(镜像体积换能力):
 # RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu && \
@@ -13,7 +13,7 @@ RUN pip install --no-cache-dir -r requirements-core.txt
 COPY shiguang/ shiguang/
 COPY run.py .
 
-# 数据(库/缩略图/密钥)全部落在 /data 卷
+# 数据库和缩略图落在 /data 卷；多人部署的密钥必须由环境变量注入
 ENV SHIGUANG_DATA=/data \
     SHIGUANG_HOST=0.0.0.0
 VOLUME /data

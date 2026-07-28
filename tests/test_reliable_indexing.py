@@ -11,6 +11,7 @@ from shiguang.config import Config
 from shiguang.embedder import DemoEmbedder
 from shiguang.indexer import Indexer
 from PIL import Image
+import pytest
 
 
 def _photo(db: DB, path: str = "/photo.jpg", sha1: str = "hash") -> int:
@@ -32,10 +33,50 @@ def test_job_state_recovery_and_content_change_requeue():
     assert db.job_stats()["running"] == 1
 
     db.recover_interrupted_jobs()
-    assert db.job_stats()["pending"] == 1
+    assert db.job_stats()["retrying"] == 1
     db.finish_job(jid, "succeeded")
     db.enqueue_job(pid, "/photo.jpg", "ocr", "rapidocr", "v1", "new-hash")
     assert db.job_stats()["pending"] == 1
+
+
+def test_job_backoff_terminal_failure_and_manual_retry():
+    db = DB(":memory:")
+    pid = _photo(db)
+    jid = db.enqueue_job(
+        pid, "/photo.jpg", "ocr", "rapidocr", "v1", "hash", max_retries=2
+    )
+
+    assert db.claim_jobs("ocr", "v1", 1, 2)
+    assert db.fail_job(jid, "temporary", base_delay=30) == "retrying"
+    row = db.list_jobs()[0]
+    assert row["next_attempt_at"] > row["updated_at"]
+    assert db.claim_jobs("ocr", "v1", 1, 2) == []
+
+    db.execute("UPDATE index_jobs SET next_attempt_at=0 WHERE id=?", (jid,))
+    assert db.claim_jobs("ocr", "v1", 1, 2)
+    assert db.fail_job(jid, "permanent", base_delay=0) == "failed"
+    assert db.retry_job(jid)
+    assert db.job_stats() == {"pending": 1}
+
+
+def test_cancelled_or_stale_job_cannot_commit_result():
+    db = DB(":memory:")
+    pid = _photo(db)
+    jid = db.enqueue_job(pid, "/photo.jpg", "embedding", "clip", "v1", "hash")
+    assert db.claim_jobs("embedding", "v1", 1, 3)
+    assert db.cancel_job(jid)
+
+    with pytest.raises(RuntimeError, match="已取消"):
+        db.save_embedding(
+            pid, b"\x00\x00\x00\x00", 1, content_hash="hash", job_id=jid
+        )
+    assert db.query("SELECT * FROM embeddings") == []
+
+
+def test_config_rejects_invalid_runtime_modes():
+    cfg = Config(fusion_mode="invented")
+    with pytest.raises(ValueError, match="fusion_mode"):
+        cfg.validate()
 
 
 def test_face_reindex_is_idempotent():
@@ -91,3 +132,37 @@ def test_indexer_persists_processor_states(tmp_path):
     )[0]
     assert row["model_name"] == cfg.embed_model
     assert row["content_hash"] == "content-v1"
+
+
+def test_indexer_retries_with_backoff_until_terminal_failure(tmp_path):
+    image_path = tmp_path / "broken-model.jpg"
+    Image.new("RGB", (8, 8), "blue").save(image_path)
+    db = DB(":memory:")
+    _photo(db, str(image_path), "content-v1")
+    cfg = Config(
+        enable_ocr=False,
+        enable_faces=False,
+        embed_backend="demo",
+        index_max_retries=2,
+        index_retry_base_seconds=0,
+    )
+
+    class BrokenEmbedder:
+        name = "broken"
+        dim = 4
+
+        def encode_images(self, _images):
+            raise TimeoutError("inference timeout")
+
+    unavailable = type("Unavailable", (), {"available": False})()
+    vindex = type("VectorIndex", (), {"refresh": lambda self: None})()
+    indexer = Indexer(
+        db, cfg, BrokenEmbedder(), unavailable, unavailable, vindex
+    )
+    indexer._ensure_jobs()
+    indexer._stage_embed()
+
+    job = db.list_jobs(status="failed")[0]
+    assert job["retry_count"] == 2
+    assert "inference timeout" in job["last_error"]
+    assert db.query("SELECT * FROM embeddings") == []

@@ -1,18 +1,19 @@
-"""v1.0:FastAPI 后端——认证(RBAC)、审计、限流、指标、健康检查 + 业务 API。
+"""个人模式 FastAPI 后端——认证、审计、限流、指标、健康检查 + 业务 API。
 
 安全模型:
 - 会话:HMAC 签名令牌,HttpOnly Cookie(浏览器)或 Authorization: Bearer(程序调用)
 - 角色:admin(索引/设置/用户/审计) / viewer(搜索/浏览)
-- 首次启动自动创建 admin,初始密码写入 data/admin_initial_password.txt
-- 单机自用:config 里 auth_enabled=false 一键关闭
+- 企业模式从环境变量注入密钥和初始管理员密码，不默认写明文密码文件
+- 单机自用默认关闭认证且只监听 127.0.0.1
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
-import threading
+import os
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
@@ -35,8 +36,10 @@ from .search import SearchEngine
 log = logging.getLogger("shiguang.api")
 WEB_DIR = Path(__file__).parent / "web"
 
-PUBLIC_PATHS = {"/", "/api/login", "/api/register", "/healthz", "/metrics", "/favicon.ico"}
-ADMIN_PREFIXES = ("/api/settings", "/api/index/start", "/api/users", "/api/audit")
+ADMIN_PREFIXES = (
+    "/api/settings", "/api/index/start", "/api/index/jobs",
+    "/api/users", "/api/audit",
+)
 
 
 class DirsBody(BaseModel):
@@ -80,14 +83,41 @@ def create_app() -> FastAPI:
     indexer = Indexer(db, cfg, embedder, ocr_engine, face_engine, engine.vindex)
     metrics = Metrics()
     limiter = RateLimiter(cfg.rate_limit_burst, cfg.rate_limit_per_sec)
+    login_limiter = RateLimiter(
+        cfg.login_rate_limit_burst, cfg.login_rate_limit_per_sec
+    )
 
-    secret = auth.load_or_create_secret(DATA_DIR / "secret.key")
+    secret = b""
     if cfg.auth_enabled:
-        pwd = auth.bootstrap_admin(db, DATA_DIR / "admin_initial_password.txt")
-        if pwd:
-            log.warning("已创建初始管理员 admin,密码见 data/admin_initial_password.txt")
+        secret = auth.load_or_create_secret(
+            DATA_DIR / "secret.key", require_env=cfg.require_env_secrets
+        )
+        bootstrap_password = os.environ.get("SHIGUANG_BOOTSTRAP_ADMIN_PASSWORD")
+        if db.count_users() == 0 and bootstrap_password:
+            auth.bootstrap_admin(db, password=bootstrap_password)
+            log.warning("已从环境变量创建初始管理员 admin，请立即轮换密码")
+        elif db.count_users() == 0 and cfg.write_bootstrap_password_file:
+            auth.bootstrap_admin(db, DATA_DIR / "admin_initial_password.txt")
+            log.warning("已创建本地初始管理员；登录后请立即删除初始密码文件")
+        elif db.count_users() == 0:
+            log.warning(
+                "认证已启用但没有用户；请设置 SHIGUANG_BOOTSTRAP_ADMIN_PASSWORD 后重启"
+            )
 
-    app = FastAPI(title="拾光", version=__version__, docs_url="/api/docs")
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        try:
+            yield
+        finally:
+            indexer.close()
+            close_vector = getattr(engine.vindex, "close", None)
+            if close_vector:
+                close_vector()
+            db.close()
+
+    app = FastAPI(
+        title="拾光", version=__version__, docs_url="/api/docs", lifespan=lifespan
+    )
     app.state.cfg = cfg
     app.state.db = db
 
@@ -95,6 +125,13 @@ def create_app() -> FastAPI:
         indexer.start_watcher()
 
     # ---------- 认证中间件 ----------
+    public_paths = {
+        "/", "/api/login", "/api/auth/config",
+        "/livez", "/readyz", "/healthz", "/favicon.ico",
+    }
+    if cfg.allow_public_registration:
+        public_paths.add("/api/register")
+
     def _current_user(request: Request) -> dict | None:
         if not cfg.auth_enabled:
             return {"u": "local", "r": "admin"}
@@ -103,18 +140,29 @@ def create_app() -> FastAPI:
             bearer = request.headers.get("Authorization", "")
             if bearer.startswith("Bearer "):
                 token = bearer[7:]
-        return auth.verify_token(secret, token) if token else None
+        payload = auth.verify_token(secret, token) if token else None
+        if not payload:
+            return None
+        # 角色和禁用状态以数据库为准，保证管理员修改后立即生效。
+        user = db.get_user(payload["u"])
+        if not user or user["disabled"]:
+            return None
+        return {"u": user["username"], "r": user["role"], "exp": payload["exp"]}
 
     @app.middleware("http")
     async def guard(request: Request, call_next):
         path = request.url.path
         user = _current_user(request)
         request.state.user = user
-        if path not in PUBLIC_PATHS and path.startswith("/api"):
+        needs_auth = path.startswith("/api") or path == "/metrics"
+        if path not in public_paths and needs_auth:
             if user is None:
                 metrics.inc_request(path, 401)
                 return JSONResponse({"detail": "未登录"}, status_code=401)
-            if any(path.startswith(p) for p in ADMIN_PREFIXES) and user["r"] != "admin":
+            admin_only = path == "/metrics" or any(
+                path.startswith(p) for p in ADMIN_PREFIXES
+            )
+            if admin_only and user["r"] != "admin":
                 metrics.inc_request(path, 403)
                 return JSONResponse({"detail": "需要管理员权限"}, status_code=403)
         resp = await call_next(request)
@@ -122,8 +170,13 @@ def create_app() -> FastAPI:
         return resp
 
     # ---------- 健康/指标 ----------
+    @app.get("/livez")
+    def livez():
+        return {"status": "ok", "version": __version__}
+
     @app.get("/healthz")
-    def healthz():
+    @app.get("/readyz")
+    def readyz():
         try:
             db.query("SELECT 1")
             semantic_ready = embedder.name != "demo"
@@ -149,31 +202,56 @@ def create_app() -> FastAPI:
 
     @app.get("/metrics")
     def metrics_endpoint():
+        if not cfg.expose_metrics:
+            raise HTTPException(404)
         s = db.stats()
         metrics.set_gauge("shiguang_index_photos_total", s.get("total", 0))
         metrics.set_gauge("shiguang_index_embedded_total", s.get("embedded", 0))
         return PlainTextResponse(metrics.render(), media_type="text/plain; version=0.0.4")
 
     # ---------- 认证 ----------
+    @app.get("/api/auth/config")
+    def auth_config():
+        return {
+            "auth_enabled": cfg.auth_enabled,
+            "public_registration": bool(
+                cfg.auth_enabled and cfg.allow_public_registration
+            ),
+        }
+
     @app.post("/api/login")
     def login(body: LoginBody, request: Request):
         if not cfg.auth_enabled:
             raise HTTPException(400, "认证未启用")
-        user = db.get_user(body.username.strip())
-        if not user or not auth.verify_password(body.password, user["pwd_hash"]):
-            db.audit(body.username, "login_failed", request.client.host if request.client else "")
+        username = body.username.strip()
+        client_ip = request.client.host if request.client else "unknown"
+        if not login_limiter.allow(f"{client_ip}:{username.lower()}"):
+            raise HTTPException(429, "登录尝试过于频繁，请稍后再试")
+        user = db.get_user(username)
+        if (
+            not user
+            or user["disabled"]
+            or not auth.verify_password(body.password, user["pwd_hash"])
+        ):
+            db.audit(username, "login_failed", client_ip)
             raise HTTPException(401, "用户名或密码错误")
-        token = auth.sign_token(secret, user["username"], user["role"])
+        token = auth.sign_token(
+            secret, user["username"], user["role"], ttl=cfg.session_ttl_seconds
+        )
         db.audit(user["username"], "login", "")
         resp = JSONResponse({"ok": True, "username": user["username"], "role": user["role"]})
-        resp.set_cookie("sg_token", token, httponly=True, samesite="lax",
-                        max_age=auth.TOKEN_TTL)
+        resp.set_cookie(
+            "sg_token", token, httponly=True, secure=cfg.cookie_secure,
+            samesite="strict", max_age=cfg.session_ttl_seconds,
+        )
         return resp
 
     @app.post("/api/register")
     def register(body: RegisterBody, request: Request):
         if not cfg.auth_enabled:
             raise HTTPException(400, "认证未启用")
+        if not cfg.allow_public_registration:
+            raise HTTPException(403, "公开注册已关闭，请联系管理员创建账号")
         username = body.username.strip()
         password = body.password
         if len(username) < 2:
@@ -191,10 +269,14 @@ def create_app() -> FastAPI:
         pwd_hash = auth.hash_password(password)
         db.create_user(username, pwd_hash, role="viewer")
         db.audit(username, "register", request.client.host if request.client else "")
-        token = auth.sign_token(secret, username, "viewer")
+        token = auth.sign_token(
+            secret, username, "viewer", ttl=cfg.session_ttl_seconds
+        )
         resp = JSONResponse({"ok": True, "username": username, "role": "viewer"})
-        resp.set_cookie("sg_token", token, httponly=True, samesite="lax",
-                        max_age=auth.TOKEN_TTL)
+        resp.set_cookie(
+            "sg_token", token, httponly=True, secure=cfg.cookie_secure,
+            samesite="strict", max_age=cfg.session_ttl_seconds,
+        )
         return resp
 
     @app.post("/api/logout")
@@ -313,9 +395,34 @@ def create_app() -> FastAPI:
     def index_start(request: Request):
         if not cfg.library_dirs:
             raise HTTPException(400, "请先在设置里添加相册目录")
-        threading.Thread(target=indexer.run_full, daemon=True).start()
+        if not indexer.start_async():
+            raise HTTPException(409, "索引任务已在运行")
         db.audit(request.state.user["u"], "index", "start")
         return {"ok": True}
+
+    @app.get("/api/index/jobs")
+    def index_jobs(status: str | None = None, limit: int = 100):
+        allowed = {
+            "pending", "running", "retrying", "succeeded",
+            "failed", "cancelled", "skipped",
+        }
+        if status and status not in allowed:
+            raise HTTPException(400, "无效任务状态")
+        return db.list_jobs(limit=limit, status=status)
+
+    @app.post("/api/index/jobs/{job_id}/retry")
+    def retry_index_job(job_id: int, request: Request):
+        if not db.retry_job(job_id):
+            raise HTTPException(409, "仅 failed/cancelled 任务可重试")
+        db.audit(request.state.user["u"], "job_retry", str(job_id))
+        return {"ok": True, "job_id": job_id}
+
+    @app.post("/api/index/jobs/{job_id}/cancel")
+    def cancel_index_job(job_id: int, request: Request):
+        if not db.cancel_job(job_id):
+            raise HTTPException(409, "任务不存在或已结束")
+        db.audit(request.state.user["u"], "job_cancel", str(job_id))
+        return {"ok": True, "job_id": job_id}
 
     @app.get("/api/index/progress")
     async def index_progress():
