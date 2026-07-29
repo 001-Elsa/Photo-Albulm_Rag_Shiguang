@@ -14,7 +14,7 @@
 | OCR 检索 | FTS5 + 中文 n-gram | `simple` tsvector + `ILIKE` + `pg_trgm` |
 | 人脸 | 检测、聚类、命名、按人物过滤 | 特征提取与存储；聚类/人物检索未完成 |
 | 可观测性 | 基础 metrics / healthz | Prometheus、Grafana、OpenTelemetry |
-| 验证程度 | 本地单测 + Demo 冒烟 | 组件集成测试已写；完整上传链路 CI 仍在补强 |
+| 验证程度 | 本地单测 + Demo 冒烟 | Postgres / Redis / MinIO / Celery 的上传索引搜索 E2E CI |
 
 ## Personal Mode
 
@@ -99,11 +99,12 @@ CI 默认跑：
 - Personal Demo API 冒烟
 - Docker 构建
 - pgvector 旁路集成
-- 企业栈组件集成（Postgres / Redis / MinIO）
+- 企业栈组件与 HTTP→Worker E2E（Postgres / Redis / MinIO / Celery）
 - Gitleaks 与 `pip-audit`
 
-完整“上传图片 → MinIO → Celery → embedding → 搜索返回”端到端链路，以及
-真实故障注入、Locust 报告、人工标注 Recall 结果，仍需在目标环境补齐后才能写进简历。
+CI 覆盖“上传图片 → MinIO → Celery → embedding → 搜索返回”和跨组织 API
+访问拒绝。真实故障注入、Locust 报告、人工标注 Recall 结果，仍需在目标环境
+补齐后才能写进简历。
 
 ## 检索评测
 

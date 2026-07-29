@@ -120,6 +120,7 @@ jobs:
           --health-timeout 3s
           --health-retries 10
     env:
+      SHIGUANG_RUN_ENTERPRISE_E2E: "1"
       SHIGUANG_TEST_ENTERPRISE_PG_ADMIN_DSN: postgresql://shiguang_admin:shiguang_admin@127.0.0.1:5432/shiguang_enterprise
       SHIGUANG_TEST_ENTERPRISE_PG_DSN: postgresql://shiguang_app:shiguang_app@127.0.0.1:5432/shiguang_enterprise
       SHIGUANG_TEST_ENTERPRISE_PG_APP_USER: shiguang_app
@@ -128,6 +129,30 @@ jobs:
       SHIGUANG_TEST_ENTERPRISE_MINIO_ENDPOINT: 127.0.0.1:9000
       SHIGUANG_TEST_ENTERPRISE_MINIO_ACCESS_KEY: shiguang
       SHIGUANG_TEST_ENTERPRISE_MINIO_SECRET_KEY: shiguang-minio-secret
+      SHIGUANG_DEPLOYMENT_MODE: enterprise
+      SHIGUANG_EMBED_BACKEND: demo
+      SHIGUANG_ENABLE_OCR: "false"
+      SHIGUANG_ENABLE_FACES: "false"
+      SHIGUANG_PG_HOST: 127.0.0.1
+      SHIGUANG_PG_PORT: "5432"
+      SHIGUANG_PG_DATABASE: shiguang_enterprise
+      SHIGUANG_PG_USER: shiguang_app
+      SHIGUANG_PG_PASSWORD: shiguang_app
+      SHIGUANG_PG_ADMIN_USER: shiguang_admin
+      SHIGUANG_PG_ADMIN_PASSWORD: shiguang_admin
+      SHIGUANG_REDIS_URL: redis://127.0.0.1:6379/0
+      SHIGUANG_CELERY_BROKER_URL: redis://127.0.0.1:6379/1
+      SHIGUANG_CELERY_RESULT_BACKEND: redis://127.0.0.1:6379/2
+      SHIGUANG_MINIO_ENDPOINT: 127.0.0.1:9000
+      SHIGUANG_MINIO_ACCESS_KEY: shiguang
+      SHIGUANG_MINIO_SECRET_KEY: shiguang-minio-secret
+      SHIGUANG_MINIO_BUCKET: shiguang-ci
+      SHIGUANG_SESSION_SECRET: ci-session-secret-at-least-thirty-two-characters
+      SHIGUANG_BOOTSTRAP_ADMIN_USERNAME: ci-e2e-admin
+      SHIGUANG_BOOTSTRAP_ADMIN_PASSWORD: ci-bootstrap-password
+      SHIGUANG_BOOTSTRAP_ORGANIZATION_NAME: Shiguang CI
+      SHIGUANG_BOOTSTRAP_ORGANIZATION_SLUG: shiguang-ci
+      SHIGUANG_QUERY_INFERENCE_TIMEOUT_SECONDS: "30"
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -147,7 +172,24 @@ jobs:
           done
           exit 1
       - run: pip install -r requirements-enterprise.txt "pytest>=9.0.3,<10"
-      - run: python -m pytest tests/test_enterprise_stack_integration.py -q
+      - name: Migrate and provision application role
+        run: python -m shiguang.infrastructure.database.migrate
+      - name: Start Celery worker
+        run: |
+          python -m celery -A shiguang.workers.celery_app.celery_app worker \
+            --loglevel=INFO --pool=solo --concurrency=1 > worker.log 2>&1 &
+          for i in $(seq 1 20); do
+            if python -m celery -A shiguang.workers.celery_app.celery_app inspect ping --timeout=2 2>/dev/null | grep -q pong; then
+              exit 0
+            fi
+            sleep 2
+          done
+          cat worker.log
+          exit 1
+      - run: >-
+          python -m pytest
+          tests/test_enterprise_stack_integration.py
+          tests/test_enterprise_e2e.py -q
 
   security:
     runs-on: ubuntu-latest
