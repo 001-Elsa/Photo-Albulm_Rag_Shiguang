@@ -40,6 +40,19 @@ def test_processor_policy_is_exhaustive_and_unimplemented_are_explicit() -> None
     assert "Unsupported processor" in source
 
 
+def test_enterprise_tracing_propagates_from_api_to_celery_workers() -> None:
+    api_source = Path("shiguang/api/app.py").read_text(encoding="utf-8")
+    worker_source = Path("shiguang/workers/celery_app.py").read_text(
+        encoding="utf-8"
+    )
+    observability_source = Path(
+        "shiguang/infrastructure/observability.py"
+    ).read_text(encoding="utf-8")
+    assert "configure_celery_publisher_tracing(cfg)" in api_source
+    assert "@worker_process_init.connect" in worker_source
+    assert "CeleryInstrumentor" in observability_source
+
+
 def test_config_save_excludes_secrets(tmp_path, monkeypatch) -> None:
     from shiguang import config as config_module
     from shiguang.config import Config

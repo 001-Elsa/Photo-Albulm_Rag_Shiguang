@@ -24,5 +24,7 @@ treat every previously committed secret as compromised:
 - Gitleaks scans the repository history on every push/PR.
 - `pip-audit` checks core, enterprise and development dependency sets.
 - Dependabot watches pip, GitHub Actions and Docker ecosystems.
+- CodeQL analyzes Python source, and Trivy blocks fixable High / Critical
+  vulnerabilities in the built container image.
 
 These controls reduce recurrence risk; they do not replace secret rotation after a leak.

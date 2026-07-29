@@ -13,6 +13,8 @@ from prometheus_client import (
 )
 
 log = logging.getLogger("shiguang.enterprise.observability")
+_tracing_configured = False
+_celery_instrumented = False
 
 
 class EnterpriseMetrics:
@@ -83,31 +85,76 @@ class EnterpriseMetrics:
         return generate_latest(self.registry)
 
 
-def configure_tracing(app: Any, cfg: Any) -> None:
+def _configure_trace_provider(cfg: Any, service_name: str) -> bool:
+    """Set one OTLP provider per process and report whether tracing is usable."""
+    global _tracing_configured
     if not cfg.otlp_endpoint:
-        return
+        return False
+    if _tracing_configured:
+        return True
     try:
         from opentelemetry import trace
         from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
             OTLPSpanExporter,
         )
-        from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
-        from opentelemetry.instrumentation.psycopg import PsycopgInstrumentor
         from opentelemetry.sdk.resources import Resource
         from opentelemetry.sdk.trace import TracerProvider
         from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
         provider = TracerProvider(
-            resource=Resource.create({"service.name": "shiguang-api"})
+            resource=Resource.create({"service.name": service_name})
         )
         provider.add_span_processor(
             BatchSpanProcessor(OTLPSpanExporter(endpoint=cfg.otlp_endpoint))
         )
         trace.set_tracer_provider(provider)
+        _tracing_configured = True
+        return True
+    except Exception as exc:
+        log.warning("OpenTelemetry provider 初始化失败: %s", exc)
+        return False
+
+
+def configure_tracing(app: Any, cfg: Any) -> None:
+    """Enable API and PostgreSQL tracing when OTLP is configured."""
+    if not _configure_trace_provider(cfg, "shiguang-api"):
+        return
+    try:
+        from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+        from opentelemetry.instrumentation.psycopg import PsycopgInstrumentor
+
         FastAPIInstrumentor.instrument_app(app)
         PsycopgInstrumentor().instrument()
     except Exception as exc:
         log.warning("OpenTelemetry 初始化失败: %s", exc)
+
+
+def configure_celery_publisher_tracing(cfg: Any) -> None:
+    """Inject the active API span context into Celery task headers."""
+    global _celery_instrumented
+    if not cfg.otlp_endpoint or _celery_instrumented:
+        return
+    try:
+        from opentelemetry.instrumentation.celery import CeleryInstrumentor
+
+        CeleryInstrumentor().instrument()
+        _celery_instrumented = True
+    except Exception as exc:
+        log.warning("Celery publisher tracing 初始化失败: %s", exc)
+
+
+def configure_celery_worker_tracing(cfg: Any) -> None:
+    """Extract Celery task context in every worker process and export spans."""
+    if not _configure_trace_provider(cfg, "shiguang-worker"):
+        return
+    try:
+        from opentelemetry.instrumentation.celery import CeleryInstrumentor
+        from opentelemetry.instrumentation.psycopg import PsycopgInstrumentor
+
+        CeleryInstrumentor().instrument()
+        PsycopgInstrumentor().instrument()
+    except Exception as exc:
+        log.warning("Celery worker tracing 初始化失败: %s", exc)
 
 
 class Timer:

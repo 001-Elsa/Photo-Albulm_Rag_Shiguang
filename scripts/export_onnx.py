@@ -81,8 +81,13 @@ def export(int8: bool):
         for src in (img_path, txt_path):
             dst = src.with_name(src.stem + "_int8.onnx")
             quantize_dynamic(str(src), str(dst), weight_type=QuantType.QInt8)
-            mb = lambda p: p.stat().st_size / 1024 / 1024
-            print(f"量化 {dst.name}: {mb(src):.1f}MB → {mb(dst):.1f}MB")
+            def megabytes(path: Path) -> float:
+                return path.stat().st_size / 1024 / 1024
+
+            print(
+                f"量化 {dst.name}: {megabytes(src):.1f}MB "
+                f"→ {megabytes(dst):.1f}MB"
+            )
 
 
 if __name__ == "__main__":

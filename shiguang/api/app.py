@@ -18,7 +18,11 @@ from ..domain.exceptions import ConflictError, DomainError, NotFoundError
 from ..infrastructure.ai import EnterpriseAIProvider
 from ..infrastructure.database import PostgresRepository
 from ..infrastructure.object_storage import MinioObjectStorage
-from ..infrastructure.observability import EnterpriseMetrics, configure_tracing
+from ..infrastructure.observability import (
+    EnterpriseMetrics,
+    configure_celery_publisher_tracing,
+    configure_tracing,
+)
 from ..infrastructure.queue import RedisRateLimiter, RedisRuntime
 from .middleware import request_context_middleware
 from .routers import admin, assets, auth, jobs, organizations, search
@@ -170,6 +174,7 @@ def create_enterprise_app(cfg) -> FastAPI:
     app.state.metrics = EnterpriseMetrics()
     app.middleware("http")(request_context_middleware)
     configure_tracing(app, cfg)
+    configure_celery_publisher_tracing(cfg)
 
     app.include_router(auth.router)
     app.include_router(organizations.router)

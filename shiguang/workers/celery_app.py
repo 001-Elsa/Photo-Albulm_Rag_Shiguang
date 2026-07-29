@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from celery import Celery
+from celery.signals import worker_process_init
 
 from ..config import Config
+from ..infrastructure.observability import configure_celery_worker_tracing
 
 cfg = Config.load()
 
@@ -32,3 +34,9 @@ celery_app.conf.update(
         },
     },
 )
+
+
+@worker_process_init.connect
+def configure_worker_telemetry(**_kwargs) -> None:
+    """Configure OTLP after Celery has created a worker process."""
+    configure_celery_worker_tracing(cfg)

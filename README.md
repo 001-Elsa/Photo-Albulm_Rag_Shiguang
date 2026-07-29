@@ -62,8 +62,10 @@ Client
 
 ```bash
 # 先把 deploy/secrets/*.example 复制为 *.txt 并填入真实密钥
-cp deploy/secrets/*.example deploy/secrets/
-# Windows 请手动复制并改后缀为 .txt
+for f in deploy/secrets/*.example; do cp "$f" "${f%.example}.txt"; done
+# PowerShell: Get-ChildItem deploy/secrets/*.example | ForEach-Object {
+#   Copy-Item $_ "$($_.FullName -replace '\.example$', '.txt')"
+# }
 
 docker compose up -d --build
 curl http://127.0.0.1:8626/readyz
@@ -100,7 +102,7 @@ CI 默认跑：
 - Docker 构建
 - pgvector 旁路集成
 - 企业栈组件与 HTTP→Worker E2E（Postgres / Redis / MinIO / Celery）
-- Gitleaks 与 `pip-audit`
+- Gitleaks、`pip-audit`、CodeQL 与镜像 Trivy 扫描
 
 CI 覆盖“上传图片 → MinIO → Celery → embedding → 搜索返回”和跨组织 API
 访问拒绝。真实故障注入、Locust 报告、人工标注 Recall 结果，仍需在目标环境
