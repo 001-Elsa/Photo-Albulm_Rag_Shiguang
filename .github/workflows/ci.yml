@@ -20,7 +20,7 @@ jobs:
         python-version: ["3.10", "3.11", "3.12"]
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install deps
@@ -87,7 +87,7 @@ jobs:
       SHIGUANG_TEST_PG_DSN: postgresql://shiguang:shiguang@127.0.0.1:5432/shiguang_test
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
       - run: pip install -r requirements-enterprise.txt pytest
@@ -130,7 +130,7 @@ jobs:
       SHIGUANG_TEST_ENTERPRISE_MINIO_SECRET_KEY: shiguang-minio-secret
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
       - name: Start MinIO
@@ -160,7 +160,7 @@ jobs:
         uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
       - name: pip-audit
