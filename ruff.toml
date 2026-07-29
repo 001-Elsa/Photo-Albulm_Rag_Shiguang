@@ -1,0 +1,22 @@
+# Pragmatic lint baseline for the internship demo repo.
+# Prefer catching real bugs over mass-reformatting FastAPI idioms.
+[lint]
+ignore = [
+  "B008",   # FastAPI Depends() defaults are idiomatic
+  "BLE001", # many intentional broad catches around optional AI backends
+  "S110",   # try/except/pass used for best-effort cleanup paths
+  "DTZ006", # local photo EXIF/mtime timestamps stay naive by design
+  "DTZ007",
+  "DTZ011",
+  "FURB161",
+  "RUF012",
+  "SIM103",
+  "SIM117",
+  "SIM118",
+  "TRY401",
+]
+
+[lint.per-file-ignores]
+"tests/*" = ["S101"]
+"eval/*" = ["T201"]
+"scripts/*" = ["T201"]

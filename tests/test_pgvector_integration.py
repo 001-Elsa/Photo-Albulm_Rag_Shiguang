@@ -11,7 +11,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from shiguang.db import DB
 from shiguang.vectorstore import PgVectorStore
 
-
 PG_DSN = os.environ.get("SHIGUANG_TEST_PG_DSN")
 pytestmark = pytest.mark.skipif(not PG_DSN, reason="requires pgvector service")
 

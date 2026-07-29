@@ -4,9 +4,17 @@ on:
   push:
   pull_request:
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       matrix:
         python-version: ["3.10", "3.11", "3.12"]
@@ -18,7 +26,18 @@ jobs:
       - name: Install deps
         run: pip install -r requirements-dev.txt
       - name: Unit tests
-        run: coverage run -m pytest tests/ -q && coverage report
+        run: >
+          coverage run -m pytest tests/ -q
+          --ignore=tests/test_enterprise_stack_integration.py
+          --ignore=tests/test_pgvector_integration.py
+          && coverage xml
+          && coverage report
+      - name: Upload coverage
+        if: matrix.python-version == '3.11'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml
+          path: coverage.xml
       - name: Ruff
         run: ruff check shiguang eval scripts tests run.py
       - name: Mypy
@@ -41,6 +60,7 @@ jobs:
 
   docker:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Build image
@@ -48,6 +68,7 @@ jobs:
 
   pgvector:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     services:
       postgres:
         image: pgvector/pgvector:pg16
@@ -71,3 +92,80 @@ jobs:
           python-version: "3.11"
       - run: pip install -r requirements-enterprise.txt pytest
       - run: pytest tests/test_pgvector_integration.py -q
+
+  enterprise-stack:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: shiguang_admin
+          POSTGRES_PASSWORD: shiguang_admin
+          POSTGRES_DB: shiguang_enterprise
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U shiguang_admin -d shiguang_enterprise"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7.4-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      SHIGUANG_TEST_ENTERPRISE_PG_ADMIN_DSN: postgresql://shiguang_admin:shiguang_admin@127.0.0.1:5432/shiguang_enterprise
+      SHIGUANG_TEST_ENTERPRISE_PG_DSN: postgresql://shiguang_app:shiguang_app@127.0.0.1:5432/shiguang_enterprise
+      SHIGUANG_TEST_ENTERPRISE_PG_APP_USER: shiguang_app
+      SHIGUANG_TEST_ENTERPRISE_PG_APP_PASSWORD: shiguang_app
+      SHIGUANG_TEST_ENTERPRISE_REDIS_URL: redis://127.0.0.1:6379/0
+      SHIGUANG_TEST_ENTERPRISE_MINIO_ENDPOINT: 127.0.0.1:9000
+      SHIGUANG_TEST_ENTERPRISE_MINIO_ACCESS_KEY: shiguang
+      SHIGUANG_TEST_ENTERPRISE_MINIO_SECRET_KEY: shiguang-minio-secret
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Start MinIO
+        run: |
+          docker run -d --name minio-ci \
+            -p 9000:9000 \
+            -e MINIO_ROOT_USER=shiguang \
+            -e MINIO_ROOT_PASSWORD=shiguang-minio-secret \
+            minio/minio:RELEASE.2025-04-22T22-12-26Z \
+            server /data --console-address ":9001"
+          for i in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:9000/minio/health/live && exit 0
+            sleep 2
+          done
+          exit 1
+      - run: pip install -r requirements-enterprise.txt pytest
+      - run: pytest tests/test_enterprise_stack_integration.py -q
+
+  security:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: pip-audit
+        run: |
+          pip install pip-audit
+          pip-audit -r requirements-core.txt
+          pip-audit -r requirements-enterprise.txt
+          pip-audit -r requirements-dev.txt

@@ -19,8 +19,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from shiguang.config import get_paths  # noqa: E402
-from shiguang.db import DB  # noqa: E402
+from shiguang.config import get_paths
+from shiguang.db import DB
 
 TEMPLATE_ROWS = [
     ("去年在海边拍的日落", ""),

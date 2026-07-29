@@ -3,15 +3,16 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import pytest
+from PIL import Image
+
+from shiguang.config import Config
 from shiguang.db import DB
+from shiguang.embedder import DemoEmbedder
+from shiguang.indexer import Indexer
 from shiguang.ocr import build_ocr_index_text, chinese_ngrams
 from shiguang.query_parser import ParsedQuery, parse_rules
 from shiguang.search import SearchEngine, intent_weights
-from shiguang.config import Config
-from shiguang.embedder import DemoEmbedder
-from shiguang.indexer import Indexer
-from PIL import Image
-import pytest
 
 
 def _photo(db: DB, path: str = "/photo.jpg", sha1: str = "hash") -> int:

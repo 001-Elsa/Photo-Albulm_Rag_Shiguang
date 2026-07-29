@@ -11,8 +11,8 @@ import threading
 
 import numpy as np
 
-from .query_parser import ParsedQuery
 from .ocr import chinese_ngrams
+from .query_parser import ParsedQuery
 from .vectorstore import create_vector_store
 
 log = logging.getLogger("shiguang.search")

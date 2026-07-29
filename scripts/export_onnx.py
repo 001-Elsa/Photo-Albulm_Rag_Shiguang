@@ -14,12 +14,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from shiguang.config import Config  # noqa: E402
+from shiguang.config import Config
 
 OUT_DIR = Path(__file__).resolve().parent.parent / "models"
 
 
-class _ImageTower:  # noqa: D401
+class _ImageTower:
     pass
 
 
@@ -81,7 +81,7 @@ def export(int8: bool):
         for src in (img_path, txt_path):
             dst = src.with_name(src.stem + "_int8.onnx")
             quantize_dynamic(str(src), str(dst), weight_type=QuantType.QInt8)
-            mb = lambda p: p.stat().st_size / 1024 / 1024  # noqa: E731
+            mb = lambda p: p.stat().st_size / 1024 / 1024
             print(f"量化 {dst.name}: {mb(src):.1f}MB → {mb(dst):.1f}MB")
 
 

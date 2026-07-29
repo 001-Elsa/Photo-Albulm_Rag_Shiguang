@@ -87,8 +87,8 @@ def train(
         )
     )
     return exported, {
-        "train_samples": int(len(train_indices)),
-        "validation_samples": int(len(check)),
+        "train_samples": len(train_indices),
+        "validation_samples": len(check),
         "validation_auc": round(auc(y[check], scores), 6),
         "validation_logloss": round(logloss, 6),
     }

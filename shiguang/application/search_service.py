@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable, Sequence
 from datetime import datetime
-from typing import Any, Callable, Sequence
+from typing import Any
 from uuid import UUID
 
 from ..query_parser import ParsedQuery, parse_rules

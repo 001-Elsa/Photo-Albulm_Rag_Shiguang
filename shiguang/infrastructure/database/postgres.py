@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Any, Iterator, Sequence
+from typing import Any
 from uuid import UUID, uuid4
 
-from psycopg.rows import dict_row
 from psycopg import sql
+from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
 from ...domain.exceptions import ConflictError, NotFoundError, StaleJobError
@@ -56,14 +57,13 @@ class PostgresRepository:
 
     @contextmanager
     def transaction(self, organization_id: UUID | str | None = None) -> Iterator[Any]:
-        with self.pool.connection() as conn:
-            with conn.transaction():
-                if organization_id is not None:
-                    conn.execute(
-                        "SELECT set_config('app.organization_id', %s, true)",
-                        (str(organization_id),),
-                    )
-                yield conn
+        with self.pool.connection() as conn, conn.transaction():
+            if organization_id is not None:
+                conn.execute(
+                    "SELECT set_config('app.organization_id', %s, true)",
+                    (str(organization_id),),
+                )
+            yield conn
 
     def health(self) -> dict[str, Any]:
         with self.pool.connection() as conn:
@@ -81,31 +81,36 @@ class PostgresRepository:
         if not 1 <= self.face_dimension <= 4096:
             raise ValueError("face_dimension 必须在 1..4096")
         migration = self._migration_v1()
-        with self.pool.connection() as conn:
-            with conn.transaction():
-                conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
-                conn.execute("CREATE EXTENSION IF NOT EXISTS pgcrypto")
-                conn.execute(
-                    """CREATE TABLE IF NOT EXISTS schema_migrations (
+        with self.pool.connection() as conn, conn.transaction():
+            conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
+            conn.execute("CREATE EXTENSION IF NOT EXISTS pgcrypto")
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS schema_migrations (
                            version INTEGER PRIMARY KEY,
                            applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
                        )"""
+            )
+            current = conn.execute(
+                "SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations"
+            ).fetchone()["version"]
+            if current < 1:
+                conn.execute(migration)
+                conn.execute(
+                    "INSERT INTO schema_migrations(version) VALUES (1)"
                 )
-                current = conn.execute(
-                    "SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations"
-                ).fetchone()["version"]
-                if current < 1:
-                    conn.execute(migration)
-                    conn.execute(
-                        "INSERT INTO schema_migrations(version) VALUES (1)"
-                    )
-                    current = 1
-                if current < 2:
-                    conn.execute(self._migration_v2())
-                    conn.execute(
-                        "INSERT INTO schema_migrations(version) VALUES (2)"
-                    )
-                    current = 2
+                current = 1
+            if current < 2:
+                conn.execute(self._migration_v2())
+                conn.execute(
+                    "INSERT INTO schema_migrations(version) VALUES (2)"
+                )
+                current = 2
+            if current < 3:
+                conn.execute(self._migration_v3())
+                conn.execute(
+                    "INSERT INTO schema_migrations(version) VALUES (3)"
+                )
+                current = 3
         return int(current)
 
     def provision_application_role(self, username: str, password: str) -> None:
@@ -113,57 +118,56 @@ class PostgresRepository:
         if not username or not password:
             raise ValueError("应用数据库账号和密码不能为空")
         identifier = sql.Identifier(username)
-        with self.pool.connection() as conn:
-            with conn.transaction():
-                exists = conn.execute(
-                    "SELECT 1 FROM pg_roles WHERE rolname=%s", (username,)
-                ).fetchone()
-                if not exists:
-                    conn.execute(
-                        sql.SQL(
-                            "CREATE ROLE {} LOGIN PASSWORD {} "
-                            "NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS"
-                        ).format(identifier, sql.Literal(password))
-                    )
-                else:
-                    conn.execute(
-                        sql.SQL(
-                            "ALTER ROLE {} WITH LOGIN PASSWORD {} "
-                            "NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS"
-                        ).format(identifier, sql.Literal(password))
-                    )
-                conn.execute(
-                    sql.SQL("GRANT CONNECT ON DATABASE {} TO {}").format(
-                        sql.Identifier(conn.info.dbname), identifier
-                    )
-                )
-                conn.execute(
-                    sql.SQL("GRANT USAGE ON SCHEMA public TO {}").format(identifier)
-                )
+        with self.pool.connection() as conn, conn.transaction():
+            exists = conn.execute(
+                "SELECT 1 FROM pg_roles WHERE rolname=%s", (username,)
+            ).fetchone()
+            if not exists:
                 conn.execute(
                     sql.SQL(
-                        "GRANT SELECT,INSERT,UPDATE,DELETE ON ALL TABLES "
-                        "IN SCHEMA public TO {}"
-                    ).format(identifier)
+                        "CREATE ROLE {} LOGIN PASSWORD {} "
+                        "NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS"
+                    ).format(identifier, sql.Literal(password))
                 )
+            else:
                 conn.execute(
                     sql.SQL(
-                        "GRANT USAGE,SELECT,UPDATE ON ALL SEQUENCES "
-                        "IN SCHEMA public TO {}"
-                    ).format(identifier)
+                        "ALTER ROLE {} WITH LOGIN PASSWORD {} "
+                        "NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS"
+                    ).format(identifier, sql.Literal(password))
                 )
-                conn.execute(
-                    sql.SQL(
-                        "ALTER DEFAULT PRIVILEGES IN SCHEMA public "
-                        "GRANT SELECT,INSERT,UPDATE,DELETE ON TABLES TO {}"
-                    ).format(identifier)
+            conn.execute(
+                sql.SQL("GRANT CONNECT ON DATABASE {} TO {}").format(
+                    sql.Identifier(conn.info.dbname), identifier
                 )
-                conn.execute(
-                    sql.SQL(
-                        "ALTER DEFAULT PRIVILEGES IN SCHEMA public "
-                        "GRANT USAGE,SELECT,UPDATE ON SEQUENCES TO {}"
-                    ).format(identifier)
-                )
+            )
+            conn.execute(
+                sql.SQL("GRANT USAGE ON SCHEMA public TO {}").format(identifier)
+            )
+            conn.execute(
+                sql.SQL(
+                    "GRANT SELECT,INSERT,UPDATE,DELETE ON ALL TABLES "
+                    "IN SCHEMA public TO {}"
+                ).format(identifier)
+            )
+            conn.execute(
+                sql.SQL(
+                    "GRANT USAGE,SELECT,UPDATE ON ALL SEQUENCES "
+                    "IN SCHEMA public TO {}"
+                ).format(identifier)
+            )
+            conn.execute(
+                sql.SQL(
+                    "ALTER DEFAULT PRIVILEGES IN SCHEMA public "
+                    "GRANT SELECT,INSERT,UPDATE,DELETE ON TABLES TO {}"
+                ).format(identifier)
+            )
+            conn.execute(
+                sql.SQL(
+                    "ALTER DEFAULT PRIVILEGES IN SCHEMA public "
+                    "GRANT USAGE,SELECT,UPDATE ON SEQUENCES TO {}"
+                ).format(identifier)
+            )
 
     def _migration_v1(self) -> str:
         embed_dim = self.embedding_dimension
@@ -467,6 +471,17 @@ class PostgresRepository:
           );
         """
 
+    @staticmethod
+    def _migration_v3() -> str:
+        return """
+        CREATE EXTENSION IF NOT EXISTS pg_trgm;
+        CREATE INDEX IF NOT EXISTS idx_ocr_text_trgm
+          ON ocr_documents USING gin (text gin_trgm_ops);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_invitation_email
+          ON organization_invitations(organization_id, email)
+          WHERE accepted_at IS NULL;
+        """
+
     # ------------------------------------------------------------------
     # Identity, organizations, membership
     # ------------------------------------------------------------------
@@ -589,6 +604,7 @@ class PostgresRepository:
         token_hash: str,
         username: str,
         password_hash: str,
+        request_id: str = "invitation-accept",
     ) -> tuple[dict[str, Any], UUID]:
         with self.transaction() as conn:
             invite = conn.execute(
@@ -620,6 +636,26 @@ class PostgresRepository:
                 """UPDATE organization_invitations SET accepted_at=now()
                    WHERE id=%s""",
                 (invite["id"],),
+            )
+            conn.execute(
+                "SELECT set_config('app.organization_id', %s, true)",
+                (str(invite["organization_id"]),),
+            )
+            conn.execute(
+                """INSERT INTO audit_events(
+                       organization_id,user_id,request_id,action,result,
+                       resource_type,resource_id,detail_json
+                   ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s::jsonb)""",
+                (
+                    invite["organization_id"],
+                    user["id"],
+                    request_id,
+                    "invitation.accept",
+                    "succeeded",
+                    "organization_invitation",
+                    invite["id"],
+                    json.dumps({"role": invite["role"]}),
+                ),
             )
         return dict(user), invite["organization_id"]
 
@@ -1067,7 +1103,11 @@ class PostgresRepository:
         return row is not None
 
     @staticmethod
-    def _assert_current_job(conn: Any, job_id: UUID | str) -> dict[str, Any]:
+    def _assert_current_job(
+        conn: Any,
+        job_id: UUID | str,
+        worker_id: str | None = None,
+    ) -> dict[str, Any]:
         job = conn.execute(
             """SELECT j.*,a.content_hash AS current_content_hash,a.deleted_at
                FROM index_jobs j JOIN assets a ON a.id=j.asset_id
@@ -1080,8 +1120,11 @@ class PostgresRepository:
             or job["cancel_requested"]
             or job["deleted_at"] is not None
             or job["content_hash"] != job["current_content_hash"]
+            or (worker_id is not None and job["worker_id"] != worker_id)
         ):
-            raise StaleJobError("任务已取消、资源已删除或内容版本已过期")
+            raise StaleJobError(
+                "任务已取消、租约失效、资源已删除或内容版本已过期"
+            )
         return dict(job)
 
     @staticmethod
@@ -1100,11 +1143,13 @@ class PostgresRepository:
         job_id: UUID | str,
         model_id: UUID | str,
         vector: Sequence[float],
+        *,
+        worker_id: str | None = None,
     ) -> None:
         if len(vector) != self.embedding_dimension:
             raise ValueError("向量维度不匹配")
         with self.transaction(organization_id) as conn:
-            job = self._assert_current_job(conn, job_id)
+            job = self._assert_current_job(conn, job_id, worker_id)
             conn.execute(
                 """INSERT INTO embeddings(
                        organization_id,asset_id,model_id,content_hash,embedding
@@ -1124,9 +1169,11 @@ class PostgresRepository:
         job_id: UUID | str,
         text: str,
         blocks: Sequence[dict[str, Any]] | None = None,
+        *,
+        worker_id: str | None = None,
     ) -> None:
         with self.transaction(organization_id) as conn:
-            job = self._assert_current_job(conn, job_id)
+            job = self._assert_current_job(conn, job_id, worker_id)
             conn.execute(
                 """INSERT INTO ocr_documents(
                        organization_id,asset_id,processor_version,content_hash,
@@ -1151,9 +1198,10 @@ class PostgresRepository:
         *,
         width: int | None = None,
         height: int | None = None,
+        worker_id: str | None = None,
     ) -> None:
         with self.transaction(organization_id) as conn:
-            job = self._assert_current_job(conn, job_id)
+            job = self._assert_current_job(conn, job_id, worker_id)
             conn.execute(
                 """UPDATE assets SET thumbnail_key=%s,width=COALESCE(%s,width),
                           height=COALESCE(%s,height),updated_at=now()
@@ -1167,9 +1215,11 @@ class PostgresRepository:
         organization_id: UUID | str,
         job_id: UUID | str,
         faces: Sequence[dict[str, Any]],
+        *,
+        worker_id: str | None = None,
     ) -> None:
         with self.transaction(organization_id) as conn:
-            job = self._assert_current_job(conn, job_id)
+            job = self._assert_current_job(conn, job_id, worker_id)
             conn.execute(
                 """DELETE FROM faces
                    WHERE organization_id=%s AND asset_id=%s
@@ -1202,12 +1252,14 @@ class PostgresRepository:
         organization_id: UUID | str,
         job_id: UUID | str,
         status: JobStatus | str = JobStatus.SUCCEEDED,
+        *,
+        worker_id: str | None = None,
     ) -> None:
         status_value = status.value if isinstance(status, JobStatus) else JobStatus(status).value
         if status_value not in (JobStatus.SUCCEEDED.value, JobStatus.SKIPPED.value):
             raise ValueError("仅允许 succeeded/skipped")
         with self.transaction(organization_id) as conn:
-            self._assert_current_job(conn, job_id)
+            self._assert_current_job(conn, job_id, worker_id)
             conn.execute(
                 """UPDATE index_jobs SET status=%s,worker_id=NULL,heartbeat_at=NULL,
                           finished_at=now(),updated_at=now() WHERE id=%s""",
@@ -1222,6 +1274,7 @@ class PostgresRepository:
         error_code: str,
         error: str,
         base_delay_seconds: float,
+        worker_id: str | None = None,
     ) -> dict[str, Any]:
         with self.transaction(organization_id) as conn:
             job = conn.execute(
@@ -1233,11 +1286,22 @@ class PostgresRepository:
                 raise NotFoundError("任务不存在")
             if job["status"] == JobStatus.CANCELLED.value:
                 return dict(job)
+            if (
+                worker_id is not None
+                and (
+                    job["status"] != JobStatus.RUNNING.value
+                    or job["worker_id"] != worker_id
+                )
+            ):
+                raise StaleJobError("任务租约已失效，拒绝旧 Worker 写入失败状态")
             terminal = job["retry_count"] >= job["max_retries"]
             next_status = (
                 JobStatus.FAILED.value if terminal else JobStatus.RETRYING.value
             )
-            delay = base_delay_seconds * (2 ** max(0, job["retry_count"] - 1))
+            delay = min(
+                300.0,
+                base_delay_seconds * (2 ** max(0, job["retry_count"] - 1)),
+            )
             row = conn.execute(
                 """UPDATE index_jobs SET status=%s,error_code=%s,last_error=%s,
                           next_attempt_at=CASE WHEN %s THEN next_attempt_at

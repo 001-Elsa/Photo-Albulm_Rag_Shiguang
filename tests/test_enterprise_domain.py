@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from uuid import uuid4
 
 import numpy as np
@@ -20,6 +21,45 @@ def test_permission_matrix_matches_enterprise_roles() -> None:
     assert not has_permission(OrganizationRole.EDITOR, Permission.MEMBER_MANAGE)
     assert has_permission(OrganizationRole.VIEWER, Permission.SEARCH)
     assert not has_permission(OrganizationRole.VIEWER, Permission.ASSET_WRITE)
+
+
+def test_processor_policy_is_exhaustive_and_unimplemented_are_explicit() -> None:
+    implemented = {
+        Processor.THUMBNAIL,
+        Processor.EMBEDDING,
+        Processor.OCR,
+        Processor.FACE,
+    }
+    reserved_unimplemented = {
+        Processor.FACE_CLUSTER,
+        Processor.VECTOR_SYNC,
+    }
+    assert set(Processor) == implemented | reserved_unimplemented
+    source = Path("shiguang/workers/tasks.py").read_text(encoding="utf-8")
+    assert "raise NotImplementedError(" in source
+    assert "Unsupported processor" in source
+
+
+def test_config_save_excludes_secrets(tmp_path, monkeypatch) -> None:
+    from shiguang import config as config_module
+    from shiguang.config import Config
+
+    monkeypatch.setattr(config_module, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(config_module, "CONFIG_FILE", tmp_path / "config.json")
+    cfg = Config(
+        pg_password="super-secret-db",
+        pg_admin_password="super-secret-admin",
+        minio_secret_key="super-secret-minio",
+        metrics_token="super-secret-metrics",
+        library_dirs=["D:/Photos"],
+    )
+    cfg.save()
+    raw = (tmp_path / "config.json").read_text(encoding="utf-8")
+    assert "super-secret-db" not in raw
+    assert "super-secret-admin" not in raw
+    assert "super-secret-minio" not in raw
+    assert "super-secret-metrics" not in raw
+    assert "D:/Photos" in raw
 
 
 def test_job_idempotency_key_covers_tenant_asset_processor_version_and_hash() -> None:

@@ -88,7 +88,9 @@ def configure_tracing(app: Any, cfg: Any) -> None:
         return
     try:
         from opentelemetry import trace
-        from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+        from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
+            OTLPSpanExporter,
+        )
         from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
         from opentelemetry.instrumentation.psycopg import PsycopgInstrumentor
         from opentelemetry.sdk.resources import Resource

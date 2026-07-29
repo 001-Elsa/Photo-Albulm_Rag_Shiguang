@@ -5,7 +5,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-
 DEFAULT_WEIGHTS = {
     "bias": -0.2,
     "semantic": 1.25,
@@ -26,7 +25,7 @@ class ExplainableReranker:
     )
 
     @classmethod
-    def from_json(cls, path: str | Path | None) -> "ExplainableReranker":
+    def from_json(cls, path: str | Path | None) -> ExplainableReranker:
         if not path:
             return cls()
         raw = json.loads(Path(path).read_text(encoding="utf-8"))

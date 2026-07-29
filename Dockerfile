@@ -12,6 +12,7 @@ RUN pip install --no-cache-dir -r requirements-enterprise.txt
 
 COPY shiguang/ shiguang/
 COPY run.py .
+COPY LICENSE .
 
 # 数据库和缩略图落在 /data 卷；多人部署的密钥必须由环境变量注入
 ENV SHIGUANG_DATA=/data \

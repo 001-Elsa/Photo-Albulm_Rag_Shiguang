@@ -16,7 +16,7 @@ from ..infrastructure.object_storage import MinioObjectStorage
 from .celery_app import celery_app
 
 log = logging.getLogger("shiguang.worker")
-_runtime: "WorkerRuntime | None" = None
+_runtime: WorkerRuntime | None = None
 _runtime_lock = threading.Lock()
 
 
@@ -144,6 +144,7 @@ def process_index_job(
                     thumbnail_key,
                     width=thumb.width,
                     height=thumb.height,
+                    worker_id=worker_id,
                 )
             elif processor == Processor.EMBEDDING:
                 model_id = str(job["processor_version"]).removeprefix("model:")
@@ -152,31 +153,48 @@ def process_index_job(
                     raise RuntimeError("任务引用的模型不存在")
                 vector = runtime.ai.encode_image(data)
                 runtime.repository.complete_embedding(
-                    organization_id, job_id, model["id"], vector
+                    organization_id,
+                    job_id,
+                    model["id"],
+                    vector,
+                    worker_id=worker_id,
                 )
             elif processor == Processor.OCR:
                 if not runtime.ai.ocr_available:
                     runtime.repository.finish_job_without_result(
-                        organization_id, job_id, JobStatus.SKIPPED
+                        organization_id,
+                        job_id,
+                        JobStatus.SKIPPED,
+                        worker_id=worker_id,
                     )
                 else:
                     text, blocks = runtime.ai.extract_ocr(data)
                     runtime.repository.complete_ocr(
-                        organization_id, job_id, text, blocks
+                        organization_id,
+                        job_id,
+                        text,
+                        blocks,
+                        worker_id=worker_id,
                     )
             elif processor == Processor.FACE:
                 if not runtime.ai.face_available:
                     runtime.repository.finish_job_without_result(
-                        organization_id, job_id, JobStatus.SKIPPED
+                        organization_id,
+                        job_id,
+                        JobStatus.SKIPPED,
+                        worker_id=worker_id,
                     )
                 else:
                     faces = runtime.ai.extract_faces(data)
                     runtime.repository.complete_faces(
-                        organization_id, job_id, faces
+                        organization_id,
+                        job_id,
+                        faces,
+                        worker_id=worker_id,
                     )
             else:
-                runtime.repository.finish_job_without_result(
-                    organization_id, job_id, JobStatus.SUCCEEDED
+                raise NotImplementedError(
+                    f"Unsupported processor: {processor.value}"
                 )
         runtime.repository.update_asset_ready_if_complete(
             organization_id, job["asset_id"]
@@ -189,6 +207,7 @@ def process_index_job(
             error_code=type(exc).__name__.upper(),
             error=str(exc),
             base_delay_seconds=runtime.cfg.job_retry_base_seconds,
+            worker_id=worker_id,
         )
         runtime.repository.update_asset_ready_if_complete(
             organization_id, job["asset_id"]

@@ -17,12 +17,17 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
-                               PlainTextResponse, StreamingResponse)
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    PlainTextResponse,
+    StreamingResponse,
+)
 from pydantic import BaseModel
 
 from . import __version__, auth
-from .config import Config, DATA_DIR, get_paths
+from .config import DATA_DIR, Config, get_paths
 from .db import DB
 from .dedup import find_duplicate_groups
 from .embedder import create_embedder

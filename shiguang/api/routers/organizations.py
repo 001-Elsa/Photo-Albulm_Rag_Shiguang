@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import re
 import hashlib
+import re
 import secrets
 from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from ... import auth as password_auth
@@ -167,12 +167,14 @@ def create_invitation(
 @router.post("/invitations/accept")
 def accept_invitation(
     body: InvitationAccept,
+    request: Request,
     repository=Depends(get_repository),
 ):
     user, organization_id = repository.accept_invitation(
         token_hash=hashlib.sha256(body.token.encode()).hexdigest(),
         username=body.username.strip(),
         password_hash=password_auth.hash_password(body.password),
+        request_id=request.state.request_id,
     )
     return {
         "user_id": str(user["id"]),

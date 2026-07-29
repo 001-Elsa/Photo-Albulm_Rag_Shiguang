@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -178,12 +178,21 @@ class Config:
 
     def save(self) -> None:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
+        # 敏感凭据只允许环境变量 / _FILE 注入，不写入本地 config.json。
+        payload = asdict(self)
+        for key in (
+            "pg_password",
+            "pg_admin_password",
+            "minio_secret_key",
+            "metrics_token",
+        ):
+            payload.pop(key, None)
         CONFIG_FILE.write_text(
-            json.dumps(asdict(self), ensure_ascii=False, indent=2), encoding="utf-8"
+            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
         )
 
     @classmethod
-    def load(cls) -> "Config":
+    def load(cls) -> Config:
         cfg = cls()
         if CONFIG_FILE.exists():
             try:

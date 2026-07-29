@@ -10,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import TypedDict
 
-from PIL import Image, ExifTags
+from PIL import ExifTags, Image
 
 from .config import IMAGE_EXTS, SCREENSHOT_NAME_HINTS
 

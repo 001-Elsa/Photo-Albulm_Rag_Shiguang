@@ -310,3 +310,116 @@ def test_minio_object_roundtrip_and_presigned_url() -> None:
     assert storage.get_bytes(key) == b"enterprise-storage"
     assert "X-Amz-Signature" in storage.presigned_get(key)
     storage.delete(key)
+
+
+def test_invitation_accept_expiry_replay_and_audit(
+    repository: PostgresRepository, tenant: dict[str, object]
+) -> None:
+    from datetime import datetime, timedelta, timezone
+
+    from shiguang.domain.exceptions import NotFoundError
+
+    org = tenant["org"]
+    owner = tenant["user"]
+    assert isinstance(org, dict)
+    assert isinstance(owner, dict)
+    suffix = uuid4().hex[:10]
+    token = f"invite-token-{suffix}"
+    token_hash = __import__("hashlib").sha256(token.encode()).hexdigest()
+    invitation = repository.create_invitation(
+        org["id"],
+        email=f"invitee-{suffix}@example.com",
+        role=OrganizationRole.VIEWER,
+        token_hash=token_hash,
+        expires_at=datetime.now(timezone.utc) + timedelta(days=2),
+        created_by=owner["id"],
+    )
+    user, organization_id = repository.accept_invitation(
+        token_hash=token_hash,
+        username=f"invitee-{suffix}",
+        password_hash="hashed-password",
+        request_id="test-invite-accept",
+    )
+    assert organization_id == org["id"]
+    assert user["email"] == f"invitee-{suffix}@example.com"
+    audits = repository.recent_audit(org["id"], limit=20)
+    assert any(row["action"] == "invitation.accept" for row in audits)
+
+    with pytest.raises(NotFoundError):
+        repository.accept_invitation(
+            token_hash=token_hash,
+            username=f"replay-{suffix}",
+            password_hash="hashed-password",
+        )
+
+    expired_hash = __import__("hashlib").sha256(f"expired-{suffix}".encode()).hexdigest()
+    repository.create_invitation(
+        org["id"],
+        email=f"expired-{suffix}@example.com",
+        role=OrganizationRole.EDITOR,
+        token_hash=expired_hash,
+        expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+        created_by=owner["id"],
+    )
+    with pytest.raises(NotFoundError):
+        repository.accept_invitation(
+            token_hash=expired_hash,
+            username=f"expired-user-{suffix}",
+            password_hash="hashed-password",
+        )
+    assert invitation["id"]
+
+
+def test_stale_worker_cannot_commit_or_fail_after_reclaim(
+    repository: PostgresRepository, tenant: dict[str, object]
+) -> None:
+    from shiguang.domain.exceptions import StaleJobError
+
+    org = tenant["org"]
+    model = tenant["model"]
+    assert isinstance(org, dict)
+    assert isinstance(model, dict)
+    asset, job = _asset(repository, tenant)
+    old = repository.claim_job(org["id"], job["id"], "old-worker")
+    assert old and old["worker_id"] == "old-worker"
+    with repository.transaction(org["id"]) as conn:
+        conn.execute(
+            """UPDATE index_jobs
+               SET heartbeat_at=now()-interval '10 minutes'
+               WHERE id=%s""",
+            (job["id"],),
+        )
+    recovered = repository.recover_stale_jobs(org["id"], stale_seconds=30)
+    assert recovered[0]["status"] == JobStatus.RETRYING.value
+    claimed = repository.claim_job(org["id"], job["id"], "new-worker")
+    assert claimed and claimed["worker_id"] == "new-worker"
+
+    vector = [0.0] * 512
+    vector[0] = 1.0
+    with pytest.raises(StaleJobError):
+        repository.complete_embedding(
+            org["id"],
+            job["id"],
+            model["id"],
+            vector,
+            worker_id="old-worker",
+        )
+    with pytest.raises(StaleJobError):
+        repository.fail_job(
+            org["id"],
+            job["id"],
+            error_code="OLD_WORKER",
+            error="should be rejected",
+            base_delay_seconds=0.01,
+            worker_id="old-worker",
+        )
+    repository.complete_embedding(
+        org["id"],
+        job["id"],
+        model["id"],
+        vector,
+        worker_id="new-worker",
+    )
+    saved = repository.list_jobs(org["id"], limit=20)
+    assert next(row for row in saved if row["id"] == job["id"])["status"] == "succeeded"
+    assert asset["id"]

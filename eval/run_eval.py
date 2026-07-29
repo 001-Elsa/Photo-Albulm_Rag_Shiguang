@@ -25,12 +25,12 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from shiguang.application.reranker import ExplainableReranker  # noqa: E402
-from shiguang.config import Config, get_paths  # noqa: E402
-from shiguang.db import DB  # noqa: E402
-from shiguang.embedder import create_embedder  # noqa: E402
-from shiguang.query_parser import ParsedQuery, parse  # noqa: E402
-from shiguang.search import SearchEngine  # noqa: E402
+from shiguang.application.reranker import ExplainableReranker
+from shiguang.config import Config, get_paths
+from shiguang.db import DB
+from shiguang.embedder import create_embedder
+from shiguang.query_parser import ParsedQuery, parse
+from shiguang.search import SearchEngine
 
 RESULTS_DIR = Path(__file__).parent / "results"
 MODES = (
