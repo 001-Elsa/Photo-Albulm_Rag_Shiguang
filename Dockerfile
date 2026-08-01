@@ -9,7 +9,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && python -m pip install --no-cache-dir --upgrade pip wheel \
     && python -m pip install --no-cache-dir -r requirements-enterprise.txt \
-    && python -m pip install --no-cache-dir --upgrade --force-reinstall "setuptools>=78.1.1" "msgpack>=1.2.1,<2"
+    && python -m pip uninstall --yes pip setuptools wheel msgpack
 
 # 语义模型按需启用(镜像体积换能力):
 # RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu && \
