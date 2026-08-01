@@ -6,6 +6,8 @@ from uuid import uuid4
 
 from fastapi import Request
 
+from .request_metadata import client_ip
+
 log = logging.getLogger("shiguang.enterprise.http")
 
 
@@ -44,7 +46,7 @@ async def request_context_middleware(request: Request, call_next):
                 request_id=request_id,
                 action=f"{request.method} {route_path}",
                 result=str(response.status_code),
-                ip_address=request.client.host if request.client else None,
+                ip_address=client_ip(request),
             )
         except Exception:
             log.exception("audit_write_failed", extra={"request_id": request_id})

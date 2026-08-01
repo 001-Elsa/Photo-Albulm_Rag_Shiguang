@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 from ...domain.exceptions import AuthenticationError
 from ...domain.models import Principal
 from ..dependencies import get_auth_service, get_principal
+from ..request_metadata import client_ip
 
 router = APIRouter(prefix="/api/v1/auth", tags=["auth"])
 
@@ -13,11 +14,6 @@ router = APIRouter(prefix="/api/v1/auth", tags=["auth"])
 class LoginRequest(BaseModel):
     username: str = Field(min_length=2, max_length=64)
     password: str = Field(min_length=8, max_length=256)
-
-
-def _client_ip(request: Request) -> str:
-    forwarded = request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
-    return forwarded or (request.client.host if request.client else "unknown")
 
 
 def _set_refresh_cookies(response: Response, request: Request, pair) -> None:
@@ -49,9 +45,9 @@ def login(
     response: Response,
     service=Depends(get_auth_service),
 ):
-    ip = _client_ip(request)
+    ip = client_ip(request)
     limiter = request.app.state.login_limiter
-    if not limiter.allow(f"ip:{ip}") or not limiter.allow(
+    if not limiter.allow(f"ip:{ip or 'unknown'}") or not limiter.allow(
         f"account:{body.username.lower()}"
     ):
         raise HTTPException(429, "登录尝试过于频繁")
@@ -93,7 +89,7 @@ def refresh(
     try:
         principal, pair = service.refresh(
             token,
-            ip_address=_client_ip(request),
+            ip_address=client_ip(request),
             user_agent=request.headers.get("User-Agent"),
         )
     except AuthenticationError as exc:

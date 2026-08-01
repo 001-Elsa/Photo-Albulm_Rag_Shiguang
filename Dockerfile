@@ -7,7 +7,7 @@ COPY requirements-core.txt requirements-enterprise.txt ./
 RUN apt-get update \
     && apt-get upgrade -y \
     && rm -rf /var/lib/apt/lists/* \
-    && python -m pip install --no-cache-dir --upgrade pip \
+    && python -m pip install --no-cache-dir --upgrade pip setuptools wheel \
     && python -m pip install --no-cache-dir -r requirements-enterprise.txt
 
 # 语义模型按需启用(镜像体积换能力):
