@@ -69,11 +69,35 @@ jobs:
         uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8
         with:
           image-ref: shiguang:ci
-          format: table
+          format: json
+          output: trivy-results.json
           exit-code: "1"
           ignore-unfixed: true
           severity: HIGH,CRITICAL
           vuln-type: os,library
+      - name: Summarize fixable image vulnerabilities
+        if: always()
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          report = Path("trivy-results.json")
+          if not report.exists():
+              print("::warning title=Trivy report unavailable::No JSON report was produced.")
+              raise SystemExit(0)
+
+          for result in json.loads(report.read_text(encoding="utf-8")).get("Results", []):
+              for vulnerability in result.get("Vulnerabilities") or []:
+                  print(
+                      "::error "
+                      f"title=Trivy {vulnerability['VulnerabilityID']}::"
+                      f"{result.get('Target', 'image')}: "
+                      f"{vulnerability.get('PkgName', 'unknown')} "
+                      f"{vulnerability.get('InstalledVersion', 'unknown')} -> "
+                      f"{vulnerability.get('FixedVersion', 'no fixed version')}"
+                  )
+          PY
 
   codeql:
     runs-on: ubuntu-latest
